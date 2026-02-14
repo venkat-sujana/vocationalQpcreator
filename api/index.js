@@ -30,7 +30,7 @@ console.log("JWT_SECRET:", process.env.JWT_SECRET);
 
 const allowedOrigins = [
   "http://localhost:3000",
-  "https://skr-learn-portal.netlify.app"
+  "https://vocational-qpcreator.vercel.app"
 ];
 
 app.use(cors({
@@ -97,6 +97,7 @@ app.post("/api/auth/register", async (req, res) => {
 app.post("/api/auth/login", async (req, res) => {
   try {
     const { email, password } = req.body;
+console.log("JWT_SECRET:", process.env.JWT_SECRET);
 
     if (!email || !password) {
       return res.status(400).json({ message: "All fields required" });
