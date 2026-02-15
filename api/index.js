@@ -37,23 +37,25 @@ const isAllowedOrigin = (origin) => {
 
   // Allow Vercel and Netlify deployment/preview URLs.
   return (
-    /^https:\/\/[a-z0-9-]+\.vercel\.app$/i.test(origin) ||
-    /^https:\/\/[a-z0-9-]+\.netlify\.app$/i.test(origin)
+    /^https:\/\/(?:www\.)?[a-z0-9-]+\.vercel\.app$/i.test(origin) ||
+    /^https:\/\/(?:www\.)?[a-z0-9-]+\.netlify\.app$/i.test(origin)
   );
 };
 
-app.use(
-  cors({
-    origin: function (origin, callback) {
-      if (!isAllowedOrigin(origin)) {
-        return callback(new Error("Not allowed by CORS"));
-      }
+const corsOptions = {
+  origin: function (origin, callback) {
+    if (!isAllowedOrigin(origin)) {
+      return callback(new Error("Not allowed by CORS"));
+    }
+    return callback(null, true);
+  },
+  credentials: true,
+};
 
-      return callback(null, true);
-    },
-    credentials: true,
-  }),
+app.use(
+  cors(corsOptions),
 );
+app.options(/.*/, cors(corsOptions));
 
 app.use(cookieParser());
 app.use(express.json());
