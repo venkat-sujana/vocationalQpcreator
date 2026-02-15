@@ -29,7 +29,7 @@ console.log("JWT_SECRET:", process.env.JWT_SECRET);
 
 
 const allowedOrigins = [
-  "http://localhost:3000",
+  
   "https://vocational-qpcreator.vercel.app"
 ];
 
