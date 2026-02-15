@@ -14,113 +14,120 @@ import Question from "./models/Question.js";
 import AnswerKey from "./models/AnswerKey.js";
 import Lecturer from "./models/Lecturer.js";
 
-
-
 // IMAGE UPLOAD IMPORTS  🔑
 import multer from "multer";
 import { CloudinaryStorage } from "multer-storage-cloudinary";
 import cloudinary from "./cloudinary.js";
-
 
 const app = express();
 const PORT = process.env.PORT || 5000;
 
 console.log("JWT_SECRET:", process.env.JWT_SECRET);
 
-
 const allowedOrigins = [
-  
-  "https://vocational-qpcreator.vercel.app"
+  "https://vocational-qpcreator.vercel.app",
+  "http://localhost:3000",
+  "http://127.0.0.1:3000",
 ];
 
-app.use(cors({
-  origin: function (origin, callback) {
-    if (!origin) return callback(null, true);
+const isAllowedOrigin = (origin) => {
+  if (!origin) return true;
+  if (allowedOrigins.includes(origin)) return true;
 
-    if (!allowedOrigins.includes(origin)) {
-      return callback(new Error("Not allowed by CORS"));
-    }
+  // Allow Vercel deployment/preview URLs.
+  return /^https:\/\/[a-z0-9-]+\.vercel\.app$/i.test(origin);
+};
 
-    return callback(null, true);
-  },
-  credentials: true
-}));
+app.use(
+  cors({
+    origin: function (origin, callback) {
+      if (!isAllowedOrigin(origin)) {
+        return callback(new Error("Not allowed by CORS"));
+      }
 
-
+      return callback(null, true);
+    },
+    credentials: true,
+  }),
+);
 
 app.use(cookieParser());
 app.use(express.json());
 
 connectDB(); // 🔑 DB connect here
 
-
 // AUTH ROUTES
 app.post("/api/auth/register", async (req, res) => {
   try {
-    console.log(req.body);  // 👈 add this
+    console.log(req.body); // 👈 add this
     const { name, email, password, collegeName } = req.body;
-    const existing = await Lecturer.findOne({ email });
-    
+    const normalizedEmail = String(email || "").trim().toLowerCase();
+    const existing = await Lecturer.findOne({ email: normalizedEmail });
+
     if (existing) {
       console.log("Email already found in DB");
       return res.status(400).json({ message: "Email already exists" });
     }
-
-
-
 
     const salt = await bcrypt.genSalt(10);
     const hashedPassword = await bcrypt.hash(password, salt);
 
     const lecturer = await Lecturer.create({
       name,
-      email,
+      email: normalizedEmail,
       password: hashedPassword,
       collegeName,
-      role: "lecturer"
+      role: "lecturer",
     });
 
     res.status(201).json({
-      message: "Lecturer Registered Successfully ✅"
+      message: "Lecturer Registered Successfully ✅",
     });
-
   } catch (error) {
     console.error("Register Error:", error);
     res.status(500).json({ message: "Server Error" });
   }
 });
 
-
-
-
 //AUTH ROUTES
 app.post("/api/auth/login", async (req, res) => {
   try {
     const { email, password } = req.body;
-console.log("JWT_SECRET:", process.env.JWT_SECRET);
+    const normalizedEmail = String(email || "").trim().toLowerCase();
 
-    if (!email || !password) {
+    if (!normalizedEmail || !password) {
       return res.status(400).json({ message: "All fields required" });
     }
 
     // 1️⃣ Check Email
-    const lecturer = await Lecturer.findOne({ email });
+    const lecturer = await Lecturer.findOne({ email: normalizedEmail });
     if (!lecturer) {
       return res.status(400).json({ message: "Invalid Email" });
     }
 
     // 2️⃣ Compare Password
-    const isMatch = await bcrypt.compare(password, lecturer.password);
+    let isMatch = false;
+    const storedPassword = lecturer.password;
+
+    if (typeof storedPassword === "string" && storedPassword.startsWith("$2")) {
+      isMatch = await bcrypt.compare(password, storedPassword);
+    } else if (typeof storedPassword === "string") {
+      // Handle legacy plaintext records and auto-upgrade hash after successful login.
+      isMatch = password === storedPassword;
+      if (isMatch) {
+        const salt = await bcrypt.genSalt(10);
+        lecturer.password = await bcrypt.hash(password, salt);
+        await lecturer.save();
+      }
+    }
     if (!isMatch) {
       return res.status(400).json({ message: "Invalid Password" });
     }
 
-
-if (!process.env.JWT_SECRET) {
-  console.error("JWT_SECRET is missing in production");
-  return res.status(500).json({ message: "Server configuration error" });
-}
-
+    if (!process.env.JWT_SECRET) {
+      console.error("JWT_SECRET is missing in production");
+      return res.status(500).json({ message: "Server configuration error" });
+    }
 
     // 3️⃣ Generate JWT
     const token = jwt.sign(
@@ -128,18 +135,18 @@ if (!process.env.JWT_SECRET) {
         id: lecturer._id,
         role: lecturer.role,
         name: lecturer.name,
-        college: lecturer.collegeName
+        college: lecturer.collegeName,
       },
       process.env.JWT_SECRET,
-      { expiresIn: "1d" }
+      { expiresIn: "1d" },
     );
 
     // 4️⃣ Set Cookie (Production Compatible)
     res.cookie("token", token, {
       httpOnly: true,
-      secure: true,        // MUST be true for HTTPS (Vercel)
-      sameSite: "none",    // REQUIRED for cross-domain
-      maxAge: 24 * 60 * 60 * 1000
+      secure: true, // MUST be true for HTTPS (Vercel)
+      sameSite: "none", // REQUIRED for cross-domain
+      maxAge: 24 * 60 * 60 * 1000,
     });
 
     return res.status(200).json({
@@ -148,18 +155,14 @@ if (!process.env.JWT_SECRET) {
         name: lecturer.name,
         email: lecturer.email,
         collegeName: lecturer.collegeName,
-        role: lecturer.role
-      }
+        role: lecturer.role,
+      },
     });
-
   } catch (error) {
     console.error("Login Error:", error);
     return res.status(500).json({ message: "Server Error" });
   }
 });
-
-    
-   
 
 // Logout Route
 
@@ -168,13 +171,8 @@ app.post("/api/auth/logout", (req, res) => {
   res.json({ message: "Logged Out Successfully" });
 });
 
-
-
-
-
 // Middleware to verify JWT and check for lecturer role
 const verifyToken = (req, res, next) => {
-
   console.log("Checking token...");
   console.log("Cookies:", req.cookies);
 
@@ -194,19 +192,14 @@ const verifyToken = (req, res, next) => {
   }
 };
 
-
 // GET CURRENT USER INFO
 app.get("/api/auth/me", verifyToken, (req, res) => {
   res.json({
     name: req.user.name,
     role: req.user.role,
-    college: req.user.college
+    college: req.user.college,
   });
 });
-
-
-
-
 
 // IMAGE UPLOAD SETUP FOR ANSWER DIAGRAMS   🔑
 
@@ -214,24 +207,17 @@ const storage = new CloudinaryStorage({
   cloudinary,
   params: {
     folder: "answer-diagrams",
-    allowed_formats: ["jpg", "png"]
-  }
+    allowed_formats: ["jpg", "png"],
+  },
 });
 
 const upload = multer({ storage });
 
-app.post(
-  "/api/upload/diagram",
-  upload.single("diagram"),
-  (req, res) => {
-    res.json({
-      imageUrl: req.file.path
-    });
-  }
-);
-
-
-
+app.post("/api/upload/diagram", upload.single("diagram"), (req, res) => {
+  res.json({
+    imageUrl: req.file.path,
+  });
+});
 
 /* ADD SYLLABUS */
 
@@ -244,18 +230,11 @@ app.get("/api/syllabus", async (req, res) => {
   }
 });
 
-
-
-
-
 /* GET ALL SYLLABUS */
 app.get("/api/syllabus", async (req, res) => {
   const syllabus = await Syllabus.find();
   res.json(syllabus);
 });
-
-
-
 
 /* ADD TOPIC */
 app.post("/api/topics", async (req, res) => {
@@ -268,25 +247,17 @@ app.post("/api/topics", async (req, res) => {
   }
 });
 
-
-
-
-
 /* GET TOPICS BY SYLLABUS ID */
 app.get("/api/topics/:syllabusId", async (req, res) => {
   try {
     const topics = await Topic.find({
-      syllabusId: req.params.syllabusId
+      syllabusId: req.params.syllabusId,
     });
     res.json(topics);
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
 });
-
-
-
-
 
 /* ADD QUESTION */
 app.post("/api/questions", async (req, res) => {
@@ -299,22 +270,17 @@ app.post("/api/questions", async (req, res) => {
   }
 });
 
-
-
-
 /* GET QUESTIONS BY TOPIC ID */
 app.get("/api/questions/topic/:topicId", async (req, res) => {
   try {
     const questions = await Question.find({
-      topicId: req.params.topicId
+      topicId: req.params.topicId,
     });
     res.json(questions);
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
 });
-
-
 
 /* ADD / UPDATE ANSWER KEYS (BULK) */
 app.post("/api/answerkeys", async (req, res) => {
@@ -323,7 +289,7 @@ app.post("/api/answerkeys", async (req, res) => {
 
     if (!Array.isArray(answerKeys)) {
       return res.status(400).json({
-        error: "Request body must be an array of answer keys"
+        error: "Request body must be an array of answer keys",
       });
     }
 
@@ -332,7 +298,7 @@ app.post("/api/answerkeys", async (req, res) => {
     for (const key of answerKeys) {
       if (!mongoose.Types.ObjectId.isValid(key.questionId)) {
         return res.status(400).json({
-          error: `Invalid questionId: ${key.questionId}`
+          error: `Invalid questionId: ${key.questionId}`,
         });
       }
 
@@ -340,8 +306,8 @@ app.post("/api/answerkeys", async (req, res) => {
         updateOne: {
           filter: { questionId: key.questionId },
           update: { $set: key },
-          upsert: true
-        }
+          upsert: true,
+        },
       });
     }
 
@@ -350,7 +316,7 @@ app.post("/api/answerkeys", async (req, res) => {
     res.status(200).json({
       message: "Answer keys bulk upsert successful ✅",
       inserted: result.upsertedCount,
-      modified: result.modifiedCount
+      modified: result.modifiedCount,
     });
   } catch (err) {
     console.error(err);
@@ -358,16 +324,11 @@ app.post("/api/answerkeys", async (req, res) => {
   }
 });
 
-
-
-
-
-
 /* GET ANSWER KEY BY QUESTION ID */
-app.get("/api/answerkeys/:questionId",verifyToken, async (req, res) => {
+app.get("/api/answerkeys/:questionId", verifyToken, async (req, res) => {
   try {
     const key = await AnswerKey.findOne({
-      questionId: req.params.questionId
+      questionId: req.params.questionId,
     });
     res.json(key);
   } catch (err) {
@@ -378,7 +339,7 @@ app.get("/api/answerkeys/:questionId",verifyToken, async (req, res) => {
 // GENERATE KEY PAPER FOR A TOPIC
 import mongoose from "mongoose";
 
-app.get("/api/keypaper/topic/:topicId",verifyToken, async (req, res) => {
+app.get("/api/keypaper/topic/:topicId", verifyToken, async (req, res) => {
   try {
     const questions = await Question.find({ topicId: req.params.topicId });
 
@@ -396,7 +357,7 @@ app.get("/api/keypaper/topic/:topicId",verifyToken, async (req, res) => {
         answerTe: answerKey ? answerKey.answerParagraphsTe : [],
 
         diagramRequired: answerKey ? answerKey.diagramRequired : false,
-        note: answerKey ? answerKey.note : "Answer not entered yet"
+        note: answerKey ? answerKey.note : "Answer not entered yet",
       });
     }
 
