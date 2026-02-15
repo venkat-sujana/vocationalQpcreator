@@ -26,6 +26,7 @@ console.log("JWT_SECRET:", process.env.JWT_SECRET);
 
 const allowedOrigins = [
   "https://vocational-qpcreator.vercel.app",
+  "https://skr-learn-portal.netlify.app",
   "http://localhost:3000",
   "http://127.0.0.1:3000",
 ];
@@ -34,8 +35,11 @@ const isAllowedOrigin = (origin) => {
   if (!origin) return true;
   if (allowedOrigins.includes(origin)) return true;
 
-  // Allow Vercel deployment/preview URLs.
-  return /^https:\/\/[a-z0-9-]+\.vercel\.app$/i.test(origin);
+  // Allow Vercel and Netlify deployment/preview URLs.
+  return (
+    /^https:\/\/[a-z0-9-]+\.vercel\.app$/i.test(origin) ||
+    /^https:\/\/[a-z0-9-]+\.netlify\.app$/i.test(origin)
+  );
 };
 
 app.use(
