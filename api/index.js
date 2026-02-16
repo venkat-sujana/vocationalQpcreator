@@ -374,4 +374,47 @@ app.get("/api/keypaper/topic/:topicId", verifyToken, async (req, res) => {
   }
 });
 
+app.post("/api/keypaper/questions", verifyToken, async (req, res) => {
+  try {
+    const { questionIds } = req.body;
+
+    if (!Array.isArray(questionIds) || questionIds.length === 0) {
+      return res.status(400).json({ error: "questionIds must be a non-empty array" });
+    }
+
+    const validIds = questionIds.filter((id) => mongoose.Types.ObjectId.isValid(id));
+    if (validIds.length === 0) {
+      return res.status(400).json({ error: "No valid questionIds provided" });
+    }
+
+    const questions = await Question.find({ _id: { $in: validIds } });
+    const questionOrder = new Map(validIds.map((id, index) => [String(id), index]));
+    questions.sort((a, b) => {
+      const aIdx = questionOrder.get(String(a._id)) ?? Number.MAX_SAFE_INTEGER;
+      const bIdx = questionOrder.get(String(b._id)) ?? Number.MAX_SAFE_INTEGER;
+      return aIdx - bIdx;
+    });
+
+    const keyPaper = [];
+
+    for (const q of questions) {
+      const answerKey = await AnswerKey.findOne({ questionId: q._id });
+      keyPaper.push({
+        questionId: q._id,
+        questionEn: q.questionTextEn,
+        questionTe: q.questionTextTe,
+        marks: q.marks,
+        answerEn: answerKey ? answerKey.answerParagraphsEn : [],
+        answerTe: answerKey ? answerKey.answerParagraphsTe : [],
+        diagramRequired: answerKey ? answerKey.diagramRequired : false,
+        note: answerKey ? answerKey.note : "Answer not entered yet",
+      });
+    }
+
+    res.json(keyPaper);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
 export default app;
