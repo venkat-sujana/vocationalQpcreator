@@ -173,7 +173,12 @@ app.post("/api/auth/login", async (req, res) => {
 // Logout Route
 
 app.post("/api/auth/logout", (req, res) => {
-  res.clearCookie("token");
+  res.clearCookie("token", {
+    httpOnly: true,
+    secure: true,
+    sameSite: "none",
+    path: "/",
+  });
   res.json({ message: "Logged Out Successfully" });
 });
 
