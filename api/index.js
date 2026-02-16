@@ -355,6 +355,7 @@ app.get("/api/keypaper/topic/:topicId", verifyToken, async (req, res) => {
       const answerKey = await AnswerKey.findOne({ questionId: q._id });
 
       keyPaper.push({
+        questionId: q._id,
         questionEn: q.questionTextEn,
         questionTe: q.questionTextTe,
         marks: q.marks,
