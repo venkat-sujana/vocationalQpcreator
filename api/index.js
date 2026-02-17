@@ -1,4 +1,4 @@
-// backend/server.js
+//backend/api/index.js
 
 import dotenv from "dotenv";
 dotenv.config();
@@ -6,6 +6,8 @@ import cookieParser from "cookie-parser";
 import jwt from "jsonwebtoken";
 import bcrypt from "bcryptjs";
 import express from "express";
+import helmet from "helmet";
+import { rateLimit } from "express-rate-limit";
 import { connectDB } from "./db.js";
 import cors from "cors";
 import Syllabus from "./models/syllabus.js";
@@ -13,6 +15,7 @@ import Topic from "./models/Topic.js";
 import Question from "./models/Question.js";
 import AnswerKey from "./models/AnswerKey.js";
 import Lecturer from "./models/Lecturer.js";
+import DownloadLog from "./models/DownloadLog.js";
 
 // IMAGE UPLOAD IMPORTS  🔑
 import multer from "multer";
@@ -21,8 +24,17 @@ import cloudinary from "./cloudinary.js";
 
 const app = express();
 const PORT = process.env.PORT || 5000;
+const isProduction = process.env.NODE_ENV === "production";
 
 console.log("JWT_SECRET:", process.env.JWT_SECRET);
+
+const adminEmails = String(process.env.ADMIN_EMAILS || "")
+  .split(",")
+  .map((email) => email.trim().toLowerCase())
+  .filter(Boolean);
+
+const isAdminEmail = (email) =>
+  adminEmails.includes(String(email || "").trim().toLowerCase());
 
 const allowedOrigins = [
   "https://vocational-qpcreator.vercel.app",
@@ -57,13 +69,39 @@ app.use(
 );
 app.options(/.*/, cors(corsOptions));
 
+app.set("trust proxy", 1);
+
+app.use(
+  helmet({
+    crossOriginResourcePolicy: false,
+  }),
+);
+
+const apiLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  limit: 300,
+  standardHeaders: "draft-8",
+  legacyHeaders: false,
+  message: { message: "Too many requests. Please try again later." },
+});
+
+const authLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  limit: 10,
+  standardHeaders: "draft-8",
+  legacyHeaders: false,
+  message: { message: "Too many auth attempts. Please try again later." },
+});
+
+app.use("/api", apiLimiter);
+
 app.use(cookieParser());
 app.use(express.json());
 
 connectDB(); // 🔑 DB connect here
 
 // AUTH ROUTES
-app.post("/api/auth/register", async (req, res) => {
+app.post("/api/auth/register", authLimiter, async (req, res) => {
   try {
     console.log(req.body); // 👈 add this
     const { name, email, password, collegeName } = req.body;
@@ -96,7 +134,7 @@ app.post("/api/auth/register", async (req, res) => {
 });
 
 //AUTH ROUTES
-app.post("/api/auth/login", async (req, res) => {
+app.post("/api/auth/login", authLimiter, async (req, res) => {
   try {
     const { email, password } = req.body;
     const normalizedEmail = String(email || "").trim().toLowerCase();
@@ -136,11 +174,16 @@ app.post("/api/auth/login", async (req, res) => {
     }
 
     // 3️⃣ Generate JWT
+    const resolvedRole = lecturer.role === "admin" || isAdminEmail(lecturer.email)
+      ? "admin"
+      : lecturer.role;
+
     const token = jwt.sign(
       {
         id: lecturer._id,
-        role: lecturer.role,
+        role: resolvedRole,
         name: lecturer.name,
+        email: lecturer.email,
         college: lecturer.collegeName,
       },
       process.env.JWT_SECRET,
@@ -150,8 +193,8 @@ app.post("/api/auth/login", async (req, res) => {
     // 4️⃣ Set Cookie (Production Compatible)
     res.cookie("token", token, {
       httpOnly: true,
-      secure: true, // MUST be true for HTTPS (Vercel)
-      sameSite: "none", // REQUIRED for cross-domain
+      secure: isProduction,
+      sameSite: isProduction ? "none" : "lax",
       maxAge: 24 * 60 * 60 * 1000,
     });
 
@@ -161,7 +204,7 @@ app.post("/api/auth/login", async (req, res) => {
         name: lecturer.name,
         email: lecturer.email,
         collegeName: lecturer.collegeName,
-        role: lecturer.role,
+        role: resolvedRole,
       },
     });
   } catch (error) {
@@ -175,8 +218,8 @@ app.post("/api/auth/login", async (req, res) => {
 app.post("/api/auth/logout", (req, res) => {
   res.clearCookie("token", {
     httpOnly: true,
-    secure: true,
-    sameSite: "none",
+    secure: isProduction,
+    sameSite: isProduction ? "none" : "lax",
     path: "/",
   });
   res.json({ message: "Logged Out Successfully" });
@@ -203,13 +246,75 @@ const verifyToken = (req, res, next) => {
   }
 };
 
+const verifyAdmin = (req, res, next) => {
+  if (req.user?.role !== "admin" && !isAdminEmail(req.user?.email)) {
+    return res.status(403).json({ message: "Admin access required" });
+  }
+  next();
+};
+
+const getClientIp = (req) => {
+  const forwardedFor = req.headers["x-forwarded-for"];
+  if (typeof forwardedFor === "string" && forwardedFor.length > 0) {
+    return forwardedFor.split(",")[0].trim();
+  }
+  return req.ip || req.socket?.remoteAddress || "unknown";
+};
+
+const logDownloadEvent = async (req, data) => {
+  try {
+    const ipAddress = getClientIp(req);
+    let resolvedCollegeName = req.user?.college || req.user?.collegeName || "";
+    if (!resolvedCollegeName && req.user?.id) {
+      const lecturer = await Lecturer.findById(req.user.id)
+        .select("collegeName")
+        .lean();
+      resolvedCollegeName = lecturer?.collegeName || "";
+    }
+
+    await DownloadLog.create({
+      userId: req.user?.id,
+      lecturerName: req.user?.name,
+      email: req.user?.email,
+      date: new Date(),
+      IP: ipAddress,
+      userName: req.user?.name,
+      userRole: req.user?.role,
+      collegeName: resolvedCollegeName,
+      ipAddress,
+      userAgent: req.get("user-agent"),
+      ...data,
+    });
+  } catch (error) {
+    console.error("Download logging failed:", error);
+  }
+};
+
 // GET CURRENT USER INFO
-app.get("/api/auth/me", verifyToken, (req, res) => {
-  res.json({
-    name: req.user.name,
-    role: req.user.role,
-    college: req.user.college,
-  });
+app.get("/api/auth/me", verifyToken, async (req, res) => {
+  try {
+    const lecturer = await Lecturer.findById(req.user.id)
+      .select("name email collegeName role");
+
+    if (!lecturer) {
+      return res.status(404).json({ message: "User not found" });
+    }
+
+    const resolvedRole = lecturer.role === "admin" || isAdminEmail(lecturer.email)
+      ? "admin"
+      : lecturer.role;
+
+    res.json({
+      name: lecturer.name,
+      email: lecturer.email,
+      role: resolvedRole,
+      college: lecturer.collegeName,
+      collegeName: lecturer.collegeName,
+    });
+  } catch (error) {
+    console.error("Me route error:", error);
+    res.status(500).json({ message: "Server Error" });
+  }
 });
 
 // IMAGE UPLOAD SETUP FOR ANSWER DIAGRAMS   🔑
@@ -373,6 +478,12 @@ app.get("/api/keypaper/topic/:topicId", verifyToken, async (req, res) => {
       });
     }
 
+    await logDownloadEvent(req, {
+      downloadType: "keypaper_topic",
+      topicId: req.params.topicId,
+      questionCount: keyPaper.length,
+    });
+
     res.json(keyPaper);
   } catch (err) {
     res.status(500).json({ error: err.message });
@@ -381,7 +492,7 @@ app.get("/api/keypaper/topic/:topicId", verifyToken, async (req, res) => {
 
 app.post("/api/keypaper/questions", verifyToken, async (req, res) => {
   try {
-    const { questionIds } = req.body;
+    const { questionIds, topicId } = req.body;
 
     if (!Array.isArray(questionIds) || questionIds.length === 0) {
       return res.status(400).json({ error: "questionIds must be a non-empty array" });
@@ -416,9 +527,152 @@ app.post("/api/keypaper/questions", verifyToken, async (req, res) => {
       });
     }
 
+    let resolvedTopicId = null;
+    if (topicId && mongoose.Types.ObjectId.isValid(topicId)) {
+      resolvedTopicId = topicId;
+    } else if (questions.length > 0 && questions[0].topicId) {
+      resolvedTopicId = questions[0].topicId;
+    }
+
+    await logDownloadEvent(req, {
+      downloadType: "keypaper_questions",
+      topicId: resolvedTopicId,
+      questionCount: keyPaper.length,
+    });
+
     res.json(keyPaper);
   } catch (err) {
     res.status(500).json({ error: err.message });
+  }
+});
+
+app.get("/api/download-logs", verifyToken, async (req, res) => {
+  try {
+    const page = Math.max(parseInt(req.query.page, 10) || 1, 1);
+    const limit = Math.min(Math.max(parseInt(req.query.limit, 10) || 20, 1), 100);
+    const skip = (page - 1) * limit;
+
+    const query = {
+      userId: req.user.id,
+    };
+
+    if (req.query.downloadType) {
+      query.downloadType = String(req.query.downloadType);
+    }
+
+    if (req.query.topicId && mongoose.Types.ObjectId.isValid(req.query.topicId)) {
+      query.topicId = req.query.topicId;
+    }
+
+    const [logs, total] = await Promise.all([
+      DownloadLog.find(query)
+        .select("lecturerName email collegeName topicId date IP")
+        .sort({ createdAt: -1 })
+        .skip(skip)
+        .limit(limit)
+        .lean(),
+      DownloadLog.countDocuments(query),
+    ]);
+
+    const formattedLogs = logs.map((log) => ({
+      lecturerName: log.lecturerName || "",
+      email: log.email || "",
+      collegeName: log.collegeName || "",
+      topicId: log.topicId || null,
+      date: log.date || null,
+      IP: log.IP || "",
+    }));
+
+    res.status(200).json({
+      page,
+      limit,
+      total,
+      totalPages: Math.ceil(total / limit),
+      logs: formattedLogs,
+    });
+  } catch (error) {
+    console.error("Fetch download logs error:", error);
+    res.status(500).json({ message: "Server Error" });
+  }
+});
+
+app.get("/api/admin/download-logs", verifyToken, verifyAdmin, async (req, res) => {
+  try {
+    const page = Math.max(parseInt(req.query.page, 10) || 1, 1);
+    const limit = Math.min(Math.max(parseInt(req.query.limit, 10) || 20, 1), 100);
+    const skip = (page - 1) * limit;
+
+    const query = {};
+
+    if (req.query.downloadType) {
+      query.downloadType = String(req.query.downloadType).trim();
+    }
+
+    if (req.query.topicId && mongoose.Types.ObjectId.isValid(req.query.topicId)) {
+      query.topicId = req.query.topicId;
+    }
+
+    if (req.query.email) {
+      query.email = String(req.query.email).trim().toLowerCase();
+    }
+
+    if (req.query.lecturerName) {
+      query.lecturerName = { $regex: String(req.query.lecturerName).trim(), $options: "i" };
+    }
+
+    if (req.query.collegeName) {
+      query.collegeName = { $regex: String(req.query.collegeName).trim(), $options: "i" };
+    }
+
+    const dateQuery = {};
+    if (req.query.fromDate) {
+      const fromDate = new Date(req.query.fromDate);
+      if (!Number.isNaN(fromDate.getTime())) {
+        dateQuery.$gte = fromDate;
+      }
+    }
+    if (req.query.toDate) {
+      const toDate = new Date(req.query.toDate);
+      if (!Number.isNaN(toDate.getTime())) {
+        toDate.setHours(23, 59, 59, 999);
+        dateQuery.$lte = toDate;
+      }
+    }
+    if (Object.keys(dateQuery).length > 0) {
+      query.date = dateQuery;
+    }
+
+    const [logs, total] = await Promise.all([
+      DownloadLog.find(query)
+        .select("lecturerName email collegeName topicId date IP downloadType questionCount")
+        .sort({ date: -1, createdAt: -1 })
+        .skip(skip)
+        .limit(limit)
+        .lean(),
+      DownloadLog.countDocuments(query),
+    ]);
+
+    const formattedLogs = logs.map((log) => ({
+      lecturerName: log.lecturerName || "",
+      email: log.email || "",
+      collegeName: log.collegeName || "",
+      topicId: log.topicId || null,
+      date: log.date || null,
+      IP: log.IP || "",
+      downloadType: log.downloadType || "",
+      questionCount: typeof log.questionCount === "number" ? log.questionCount : 0,
+    }));
+
+    res.status(200).json({
+      page,
+      limit,
+      total,
+      totalPages: Math.ceil(total / limit),
+      logs: formattedLogs,
+    });
+  } catch (error) {
+    console.error("Fetch admin download logs error:", error);
+    res.status(500).json({ message: "Server Error" });
   }
 });
 
