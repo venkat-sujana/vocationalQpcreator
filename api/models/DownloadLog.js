@@ -49,6 +49,26 @@ const downloadLogSchema = new mongoose.Schema(
       type: Number,
       default: 0,
     },
+    paperType: {
+      type: String,
+      trim: true,
+    },
+    subject: {
+      type: String,
+      trim: true,
+    },
+    examName: {
+      type: String,
+      trim: true,
+    },
+    academicYear: {
+      type: String,
+      trim: true,
+    },
+    examSession: {
+      type: String,
+      trim: true,
+    },
     ipAddress: {
       type: String,
       trim: true,

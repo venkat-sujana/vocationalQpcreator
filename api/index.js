@@ -16,6 +16,7 @@ import Question from "./models/Question.js";
 import AnswerKey from "./models/AnswerKey.js";
 import Lecturer from "./models/Lecturer.js";
 import DownloadLog from "./models/DownloadLog.js";
+import RegistrationAuditLog from "./models/RegistrationAuditLog.js";
 
 // IMAGE UPLOAD IMPORTS  🔑
 import multer from "multer";
@@ -35,6 +36,9 @@ const adminEmails = String(process.env.ADMIN_EMAILS || "")
 
 const isAdminEmail = (email) =>
   adminEmails.includes(String(email || "").trim().toLowerCase());
+
+const registrationSecret = String(process.env.REGISTRATION_SECRET || "").trim();
+const adminPanelSecret = String(process.env.ADMIN_PANEL_SECRET || "").trim();
 
 const allowedOrigins = [
   "https://vocational-qpcreator.vercel.app",
@@ -93,6 +97,22 @@ const authLimiter = rateLimit({
   message: { message: "Too many auth attempts. Please try again later." },
 });
 
+const registerAttemptLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  limit: 3,
+  standardHeaders: "draft-8",
+  legacyHeaders: false,
+  skipSuccessfulRequests: true,
+  message: { message: "Too many failed registration attempts. Please try again later." },
+  handler: (req, res, _next, options) => {
+    void logRegistrationEvent(req, {
+      status: "blocked",
+      reason: "rate_limited",
+    });
+    return res.status(options.statusCode).json(options.message);
+  },
+});
+
 app.use("/api", apiLimiter);
 
 app.use(cookieParser());
@@ -101,31 +121,82 @@ app.use(express.json());
 connectDB(); // 🔑 DB connect here
 
 // AUTH ROUTES
-app.post("/api/auth/register", authLimiter, async (req, res) => {
+app.post("/api/auth/register", registerAttemptLimiter, async (req, res) => {
   try {
-    console.log(req.body); // 👈 add this
-    const { name, email, password, collegeName } = req.body;
+    const { name, email, password, collegeName, secretKey } = req.body;
+    const normalizedName = String(name || "").trim();
     const normalizedEmail = String(email || "").trim().toLowerCase();
+    const normalizedCollegeName = String(collegeName || "").trim();
+    const normalizedSecretKey = String(secretKey || "").trim();
+
+    if (!normalizedName || !normalizedEmail || !password || !normalizedCollegeName || !normalizedSecretKey) {
+      await logRegistrationEvent(req, {
+        name: normalizedName,
+        email: normalizedEmail,
+        collegeName: normalizedCollegeName,
+        status: "failed",
+        reason: "missing_fields",
+      });
+      return res.status(400).json({ message: "All fields are required" });
+    }
+
+    if (!registrationSecret) {
+      console.error("REGISTRATION_SECRET is missing");
+      await logRegistrationEvent(req, {
+        name: normalizedName,
+        email: normalizedEmail,
+        collegeName: normalizedCollegeName,
+        status: "failed",
+        reason: "server_secret_missing",
+      });
+      return res.status(500).json({ message: "Server configuration error" });
+    }
+
+    if (normalizedSecretKey !== registrationSecret) {
+      await logRegistrationEvent(req, {
+        name: normalizedName,
+        email: normalizedEmail,
+        collegeName: normalizedCollegeName,
+        status: "failed",
+        reason: "invalid_secret_key",
+      });
+      return res.status(403).json({ message: "Invalid registration secret key" });
+    }
+
     const existing = await Lecturer.findOne({ email: normalizedEmail });
 
     if (existing) {
-      console.log("Email already found in DB");
+      await logRegistrationEvent(req, {
+        name: normalizedName,
+        email: normalizedEmail,
+        collegeName: normalizedCollegeName,
+        status: "failed",
+        reason: "email_already_exists",
+      });
       return res.status(400).json({ message: "Email already exists" });
     }
 
     const salt = await bcrypt.genSalt(10);
     const hashedPassword = await bcrypt.hash(password, salt);
 
-    const lecturer = await Lecturer.create({
-      name,
+    await Lecturer.create({
+      name: normalizedName,
       email: normalizedEmail,
       password: hashedPassword,
-      collegeName,
+      collegeName: normalizedCollegeName,
       role: "lecturer",
     });
 
+    await logRegistrationEvent(req, {
+      name: normalizedName,
+      email: normalizedEmail,
+      collegeName: normalizedCollegeName,
+      status: "success",
+      reason: "registered",
+    });
+
     res.status(201).json({
-      message: "Lecturer Registered Successfully ✅",
+      message: "Lecturer registered successfully",
     });
   } catch (error) {
     console.error("Register Error:", error);
@@ -253,12 +324,45 @@ const verifyAdmin = (req, res, next) => {
   next();
 };
 
+const verifyAdminPanelSecret = (req, res, next) => {
+  if (!adminPanelSecret) {
+    return res.status(500).json({ message: "Admin panel secret is not configured" });
+  }
+
+  const providedSecret = String(req.get("x-admin-panel-key") || "").trim();
+  if (!providedSecret || providedSecret !== adminPanelSecret) {
+    return res.status(403).json({ message: "Invalid admin panel secret key" });
+  }
+
+  next();
+};
+
 const getClientIp = (req) => {
   const forwardedFor = req.headers["x-forwarded-for"];
   if (typeof forwardedFor === "string" && forwardedFor.length > 0) {
     return forwardedFor.split(",")[0].trim();
   }
   return req.ip || req.socket?.remoteAddress || "unknown";
+};
+
+const logRegistrationEvent = async (req, data) => {
+  try {
+    await RegistrationAuditLog.create({
+      name: String(data.name || "").trim(),
+      email: String(data.email || "").trim().toLowerCase(),
+      collegeName: String(data.collegeName || "").trim(),
+      status: String(data.status || "").trim(),
+      reason: String(data.reason || "").trim(),
+      ipAddress: getClientIp(req),
+      userAgent: req.get("user-agent"),
+      origin: req.get("origin"),
+      path: req.originalUrl,
+      method: req.method,
+      attemptedAt: new Date(),
+    });
+  } catch (error) {
+    console.error("Registration audit logging failed:", error);
+  }
 };
 
 const logDownloadEvent = async (req, data) => {
@@ -546,6 +650,34 @@ app.post("/api/keypaper/questions", verifyToken, async (req, res) => {
   }
 });
 
+app.post("/api/questionpaper/download-log", verifyToken, async (req, res) => {
+  try {
+    const {
+      paperType,
+      subject,
+      examName,
+      academicYear,
+      examSession,
+      questionCount,
+    } = req.body || {};
+
+    await logDownloadEvent(req, {
+      downloadType: "questionpaper_pdf",
+      paperType: String(paperType || "").trim(),
+      subject: String(subject || "").trim(),
+      examName: String(examName || "").trim(),
+      academicYear: String(academicYear || "").trim(),
+      examSession: String(examSession || "").trim(),
+      questionCount: Number.isFinite(Number(questionCount)) ? Number(questionCount) : 0,
+    });
+
+    return res.status(201).json({ message: "Question paper download logged" });
+  } catch (error) {
+    console.error("Question paper download log error:", error);
+    return res.status(500).json({ message: "Server Error" });
+  }
+});
+
 app.get("/api/download-logs", verifyToken, async (req, res) => {
   try {
     const page = Math.max(parseInt(req.query.page, 10) || 1, 1);
@@ -566,7 +698,7 @@ app.get("/api/download-logs", verifyToken, async (req, res) => {
 
     const [logs, total] = await Promise.all([
       DownloadLog.find(query)
-        .select("lecturerName email collegeName topicId date IP")
+        .select("lecturerName email collegeName topicId date IP downloadType questionCount paperType subject examName academicYear examSession")
         .sort({ createdAt: -1 })
         .skip(skip)
         .limit(limit)
@@ -581,6 +713,13 @@ app.get("/api/download-logs", verifyToken, async (req, res) => {
       topicId: log.topicId || null,
       date: log.date || null,
       IP: log.IP || "",
+      downloadType: log.downloadType || "",
+      questionCount: typeof log.questionCount === "number" ? log.questionCount : 0,
+      paperType: log.paperType || "",
+      subject: log.subject || "",
+      examName: log.examName || "",
+      academicYear: log.academicYear || "",
+      examSession: log.examSession || "",
     }));
 
     res.status(200).json({
@@ -596,7 +735,7 @@ app.get("/api/download-logs", verifyToken, async (req, res) => {
   }
 });
 
-app.get("/api/admin/download-logs", verifyToken, verifyAdmin, async (req, res) => {
+app.get("/api/admin/download-logs", verifyToken, verifyAdmin, verifyAdminPanelSecret, async (req, res) => {
   try {
     const page = Math.max(parseInt(req.query.page, 10) || 1, 1);
     const limit = Math.min(Math.max(parseInt(req.query.limit, 10) || 20, 1), 100);
@@ -644,7 +783,7 @@ app.get("/api/admin/download-logs", verifyToken, verifyAdmin, async (req, res) =
 
     const [logs, total] = await Promise.all([
       DownloadLog.find(query)
-        .select("lecturerName email collegeName topicId date IP downloadType questionCount")
+        .select("lecturerName email collegeName topicId date IP downloadType questionCount paperType subject examName academicYear examSession")
         .sort({ date: -1, createdAt: -1 })
         .skip(skip)
         .limit(limit)
@@ -661,6 +800,11 @@ app.get("/api/admin/download-logs", verifyToken, verifyAdmin, async (req, res) =
       IP: log.IP || "",
       downloadType: log.downloadType || "",
       questionCount: typeof log.questionCount === "number" ? log.questionCount : 0,
+      paperType: log.paperType || "",
+      subject: log.subject || "",
+      examName: log.examName || "",
+      academicYear: log.academicYear || "",
+      examSession: log.examSession || "",
     }));
 
     res.status(200).json({
@@ -676,4 +820,96 @@ app.get("/api/admin/download-logs", verifyToken, verifyAdmin, async (req, res) =
   }
 });
 
+app.get("/api/admin/verify-panel-key", verifyToken, verifyAdmin, verifyAdminPanelSecret, (req, res) => {
+  res.status(200).json({ message: "Admin panel key verified" });
+});
+
+app.get("/api/admin/registration-audit-logs", verifyToken, verifyAdmin, verifyAdminPanelSecret, async (req, res) => {
+  try {
+    const page = Math.max(parseInt(req.query.page, 10) || 1, 1);
+    const limit = Math.min(Math.max(parseInt(req.query.limit, 10) || 20, 1), 100);
+    const skip = (page - 1) * limit;
+
+    const query = {};
+
+    if (req.query.status) {
+      query.status = String(req.query.status).trim().toLowerCase();
+    }
+
+    if (req.query.reason) {
+      query.reason = { $regex: String(req.query.reason).trim(), $options: "i" };
+    }
+
+    if (req.query.email) {
+      query.email = String(req.query.email).trim().toLowerCase();
+    }
+
+    if (req.query.name) {
+      query.name = { $regex: String(req.query.name).trim(), $options: "i" };
+    }
+
+    if (req.query.collegeName) {
+      query.collegeName = { $regex: String(req.query.collegeName).trim(), $options: "i" };
+    }
+
+    if (req.query.ipAddress) {
+      query.ipAddress = String(req.query.ipAddress).trim();
+    }
+
+    const attemptedAtQuery = {};
+    if (req.query.fromDate) {
+      const fromDate = new Date(req.query.fromDate);
+      if (!Number.isNaN(fromDate.getTime())) {
+        attemptedAtQuery.$gte = fromDate;
+      }
+    }
+    if (req.query.toDate) {
+      const toDate = new Date(req.query.toDate);
+      if (!Number.isNaN(toDate.getTime())) {
+        toDate.setHours(23, 59, 59, 999);
+        attemptedAtQuery.$lte = toDate;
+      }
+    }
+    if (Object.keys(attemptedAtQuery).length > 0) {
+      query.attemptedAt = attemptedAtQuery;
+    }
+
+    const [logs, total] = await Promise.all([
+      RegistrationAuditLog.find(query)
+        .select("name email collegeName status reason ipAddress userAgent origin path method attemptedAt")
+        .sort({ attemptedAt: -1, createdAt: -1 })
+        .skip(skip)
+        .limit(limit)
+        .lean(),
+      RegistrationAuditLog.countDocuments(query),
+    ]);
+
+    const formattedLogs = logs.map((log) => ({
+      name: log.name || "",
+      email: log.email || "",
+      collegeName: log.collegeName || "",
+      status: log.status || "",
+      reason: log.reason || "",
+      ipAddress: log.ipAddress || "",
+      userAgent: log.userAgent || "",
+      origin: log.origin || "",
+      path: log.path || "",
+      method: log.method || "",
+      attemptedAt: log.attemptedAt || null,
+    }));
+
+    res.status(200).json({
+      page,
+      limit,
+      total,
+      totalPages: Math.ceil(total / limit),
+      logs: formattedLogs,
+    });
+  } catch (error) {
+    console.error("Fetch registration audit logs error:", error);
+    res.status(500).json({ message: "Server Error" });
+  }
+});
+
 export default app;
+
