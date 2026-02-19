@@ -337,6 +337,144 @@ const verifyAdminPanelSecret = (req, res, next) => {
   next();
 };
 
+const normalizeText = (value) => String(value ?? "").trim();
+
+const normalizeParagraphs = (value) => {
+  if (!Array.isArray(value)) return [];
+  return value
+    .map((item) => String(item ?? "").trim())
+    .filter(Boolean);
+};
+
+const buildQuestionUpdate = (body = {}) => {
+  const update = {};
+
+  if (Object.prototype.hasOwnProperty.call(body, "questionTextEn")) {
+    const questionTextEn = normalizeText(body.questionTextEn);
+    if (!questionTextEn) {
+      return { error: "questionTextEn cannot be empty" };
+    }
+    update.questionTextEn = questionTextEn;
+  }
+
+  if (Object.prototype.hasOwnProperty.call(body, "questionTextTe")) {
+    const questionTextTe = normalizeText(body.questionTextTe);
+    if (!questionTextTe) {
+      return { error: "questionTextTe cannot be empty" };
+    }
+    update.questionTextTe = questionTextTe;
+  }
+
+  if (Object.prototype.hasOwnProperty.call(body, "questionType")) {
+    const questionType = normalizeText(body.questionType).toUpperCase();
+    if (!["SA", "LA"].includes(questionType)) {
+      return { error: "questionType must be SA or LA" };
+    }
+    update.questionType = questionType;
+  }
+
+  if (Object.prototype.hasOwnProperty.call(body, "marks")) {
+    const marks = Number(body.marks);
+    if (!Number.isFinite(marks) || marks <= 0) {
+      return { error: "marks must be a positive number" };
+    }
+    update.marks = marks;
+  }
+
+  if (Object.prototype.hasOwnProperty.call(body, "boardFrequency")) {
+    const boardFrequency = Number(body.boardFrequency);
+    if (!Number.isFinite(boardFrequency) || boardFrequency < 0) {
+      return { error: "boardFrequency must be zero or a positive number" };
+    }
+    update.boardFrequency = boardFrequency;
+  }
+
+  return { update };
+};
+
+const buildQuestionCreate = (body = {}) => {
+  const syllabusId = String(body.syllabusId || "").trim();
+  const topicId = String(body.topicId || "").trim();
+  const questionTextEn = normalizeText(body.questionTextEn);
+  const questionTextTe = normalizeText(body.questionTextTe);
+  const questionType = normalizeText(body.questionType).toUpperCase();
+  const marks = Number(body.marks);
+  const boardFrequency = Object.prototype.hasOwnProperty.call(body, "boardFrequency")
+    ? Number(body.boardFrequency)
+    : 0;
+
+  if (!mongoose.Types.ObjectId.isValid(syllabusId)) {
+    return { error: "Invalid syllabusId" };
+  }
+  if (!mongoose.Types.ObjectId.isValid(topicId)) {
+    return { error: "Invalid topicId" };
+  }
+  if (!questionTextEn) {
+    return { error: "questionTextEn is required" };
+  }
+  if (!questionTextTe) {
+    return { error: "questionTextTe is required" };
+  }
+  if (!["SA", "LA"].includes(questionType)) {
+    return { error: "questionType must be SA or LA" };
+  }
+  if (!Number.isFinite(marks) || marks <= 0) {
+    return { error: "marks must be a positive number" };
+  }
+  if (!Number.isFinite(boardFrequency) || boardFrequency < 0) {
+    return { error: "boardFrequency must be zero or a positive number" };
+  }
+
+  return {
+    payload: {
+      syllabusId,
+      topicId,
+      questionTextEn,
+      questionTextTe,
+      questionType,
+      marks,
+      boardFrequency,
+    },
+  };
+};
+
+const buildAnswerKeyUpdate = (body = {}) => {
+  const answerPayload = body.answerKey && typeof body.answerKey === "object"
+    ? body.answerKey
+    : body;
+  const update = {};
+
+  if (Object.prototype.hasOwnProperty.call(answerPayload, "marks")) {
+    const marks = Number(answerPayload.marks);
+    if (!Number.isFinite(marks) || marks <= 0) {
+      return { error: "answer key marks must be a positive number" };
+    }
+    update.marks = marks;
+  }
+
+  if (Object.prototype.hasOwnProperty.call(answerPayload, "answerParagraphsEn")) {
+    update.answerParagraphsEn = normalizeParagraphs(answerPayload.answerParagraphsEn);
+  }
+
+  if (Object.prototype.hasOwnProperty.call(answerPayload, "answerParagraphsTe")) {
+    update.answerParagraphsTe = normalizeParagraphs(answerPayload.answerParagraphsTe);
+  }
+
+  if (Object.prototype.hasOwnProperty.call(answerPayload, "diagramImageUrl")) {
+    update.diagramImageUrl = normalizeText(answerPayload.diagramImageUrl);
+  }
+
+  if (Object.prototype.hasOwnProperty.call(answerPayload, "diagramRequired")) {
+    update.diagramRequired = Boolean(answerPayload.diagramRequired);
+  }
+
+  if (Object.prototype.hasOwnProperty.call(answerPayload, "note")) {
+    update.note = normalizeText(answerPayload.note);
+  }
+
+  return { update };
+};
+
 const getClientIp = (req) => {
   const forwardedFor = req.headers["x-forwarded-for"];
   if (typeof forwardedFor === "string" && forwardedFor.length > 0) {
@@ -483,7 +621,11 @@ app.get("/api/topics/:syllabusId", async (req, res) => {
 app.post("/api/questions", async (req, res) => {
   try {
     console.log("Received question data:", req.body);
-    const question = await Question.create(req.body);
+    const createResult = buildQuestionCreate(req.body);
+    if (createResult.error) {
+      return res.status(400).json({ error: createResult.error });
+    }
+    const question = await Question.create(createResult.payload);
     res.status(201).json(question);
   } catch (err) {
     res.status(500).json({ error: err.message });
@@ -495,6 +637,7 @@ app.get("/api/questions/topic/:topicId", async (req, res) => {
   try {
     const questions = await Question.find({
       topicId: req.params.topicId,
+      isDeleted: { $ne: true },
     });
     res.json(questions);
   } catch (err) {
@@ -561,7 +704,10 @@ import mongoose from "mongoose";
 
 app.get("/api/keypaper/topic/:topicId", verifyToken, async (req, res) => {
   try {
-    const questions = await Question.find({ topicId: req.params.topicId });
+    const questions = await Question.find({
+      topicId: req.params.topicId,
+      isDeleted: { $ne: true },
+    });
 
     const keyPaper = [];
 
@@ -607,7 +753,10 @@ app.post("/api/keypaper/questions", verifyToken, async (req, res) => {
       return res.status(400).json({ error: "No valid questionIds provided" });
     }
 
-    const questions = await Question.find({ _id: { $in: validIds } });
+    const questions = await Question.find({
+      _id: { $in: validIds },
+      isDeleted: { $ne: true },
+    });
     const questionOrder = new Map(validIds.map((id, index) => [String(id), index]));
     questions.sort((a, b) => {
       const aIdx = questionOrder.get(String(a._id)) ?? Number.MAX_SAFE_INTEGER;
@@ -822,6 +971,309 @@ app.get("/api/admin/download-logs", verifyToken, verifyAdmin, verifyAdminPanelSe
 
 app.get("/api/admin/verify-panel-key", verifyToken, verifyAdmin, verifyAdminPanelSecret, (req, res) => {
   res.status(200).json({ message: "Admin panel key verified" });
+});
+
+app.get("/api/admin/question-bank/topic/:topicId", verifyToken, verifyAdmin, verifyAdminPanelSecret, async (req, res) => {
+  try {
+    const { topicId } = req.params;
+    if (!mongoose.Types.ObjectId.isValid(topicId)) {
+      return res.status(400).json({ message: "Invalid topicId" });
+    }
+
+    const includeDeleted = String(req.query.includeDeleted || "").trim().toLowerCase() === "true";
+    const query = { topicId };
+    if (!includeDeleted) {
+      query.isDeleted = { $ne: true };
+    }
+
+    const questions = await Question.find(query)
+      .sort({ createdAt: -1, _id: -1 })
+      .lean();
+    const questionIds = questions.map((question) => question._id);
+
+    const answerKeys = await AnswerKey.find({ questionId: { $in: questionIds } }).lean();
+    const answerKeyMap = new Map(answerKeys.map((key) => [String(key.questionId), key]));
+
+    const response = questions.map((question) => ({
+      ...question,
+      answerKey: answerKeyMap.get(String(question._id)) || null,
+    }));
+
+    return res.status(200).json({ questions: response, count: response.length });
+  } catch (error) {
+    console.error("Fetch admin question bank by topic error:", error);
+    return res.status(500).json({ message: "Server Error" });
+  }
+});
+
+app.post("/api/admin/question-bank", verifyToken, verifyAdmin, verifyAdminPanelSecret, async (req, res) => {
+  try {
+    const createResult = buildQuestionCreate(req.body);
+    if (createResult.error) {
+      return res.status(400).json({ message: createResult.error });
+    }
+
+    const question = await Question.create(createResult.payload);
+    let answerKey = null;
+
+    const answerKeyResult = buildAnswerKeyUpdate(req.body);
+    if (answerKeyResult.error) {
+      return res.status(400).json({ message: answerKeyResult.error });
+    }
+
+    if (Object.keys(answerKeyResult.update).length > 0) {
+      answerKey = await AnswerKey.findOneAndUpdate(
+        { questionId: question._id },
+        { $set: { ...answerKeyResult.update, questionId: question._id } },
+        { new: true, upsert: true },
+      ).lean();
+    }
+
+    return res.status(201).json({
+      message: "Question created successfully",
+      question: question.toObject(),
+      answerKey,
+    });
+  } catch (error) {
+    console.error("Create admin question bank item error:", error);
+    return res.status(500).json({ message: "Server Error" });
+  }
+});
+
+app.get("/api/admin/question-bank/:questionId", verifyToken, verifyAdmin, verifyAdminPanelSecret, async (req, res) => {
+  try {
+    const { questionId } = req.params;
+    if (!mongoose.Types.ObjectId.isValid(questionId)) {
+      return res.status(400).json({ message: "Invalid questionId" });
+    }
+
+    const [question, answerKey] = await Promise.all([
+      Question.findById(questionId).lean(),
+      AnswerKey.findOne({ questionId }).lean(),
+    ]);
+
+    if (!question) {
+      return res.status(404).json({ message: "Question not found" });
+    }
+
+    return res.status(200).json({
+      ...question,
+      answerKey: answerKey || null,
+    });
+  } catch (error) {
+    console.error("Fetch admin question bank item error:", error);
+    return res.status(500).json({ message: "Server Error" });
+  }
+});
+
+app.delete("/api/admin/question-bank/:questionId", verifyToken, verifyAdmin, verifyAdminPanelSecret, async (req, res) => {
+  try {
+    const { questionId } = req.params;
+    if (!mongoose.Types.ObjectId.isValid(questionId)) {
+      return res.status(400).json({ message: "Invalid questionId" });
+    }
+
+    const question = await Question.findById(questionId);
+    if (!question) {
+      return res.status(404).json({ message: "Question not found" });
+    }
+
+    if (!question.isDeleted) {
+      question.isDeleted = true;
+      question.deletedAt = new Date();
+      question.deletedBy = String(req.user?.email || req.user?.id || "").trim();
+      await question.save();
+    }
+
+    return res.status(200).json({
+      message: "Question deleted successfully",
+      question: question.toObject(),
+    });
+  } catch (error) {
+    console.error("Delete admin question bank item error:", error);
+    return res.status(500).json({ message: "Server Error" });
+  }
+});
+
+app.post("/api/admin/question-bank/:questionId/restore", verifyToken, verifyAdmin, verifyAdminPanelSecret, async (req, res) => {
+  try {
+    const { questionId } = req.params;
+    if (!mongoose.Types.ObjectId.isValid(questionId)) {
+      return res.status(400).json({ message: "Invalid questionId" });
+    }
+
+    const question = await Question.findById(questionId);
+    if (!question) {
+      return res.status(404).json({ message: "Question not found" });
+    }
+
+    if (question.isDeleted) {
+      question.isDeleted = false;
+      question.deletedAt = null;
+      question.deletedBy = "";
+      await question.save();
+    }
+
+    return res.status(200).json({
+      message: "Question restored successfully",
+      question: question.toObject(),
+    });
+  } catch (error) {
+    console.error("Restore admin question bank item error:", error);
+    return res.status(500).json({ message: "Server Error" });
+  }
+});
+
+app.put("/api/admin/question-bank/:questionId", verifyToken, verifyAdmin, verifyAdminPanelSecret, async (req, res) => {
+  try {
+    const { questionId } = req.params;
+    if (!mongoose.Types.ObjectId.isValid(questionId)) {
+      return res.status(400).json({ message: "Invalid questionId" });
+    }
+
+    const questionResult = buildQuestionUpdate(req.body);
+    if (questionResult.error) {
+      return res.status(400).json({ message: questionResult.error });
+    }
+
+    const answerKeyResult = buildAnswerKeyUpdate(req.body);
+    if (answerKeyResult.error) {
+      return res.status(400).json({ message: answerKeyResult.error });
+    }
+
+    const question = await Question.findById(questionId);
+    if (!question) {
+      return res.status(404).json({ message: "Question not found" });
+    }
+
+    if (Object.keys(questionResult.update).length > 0) {
+      Object.assign(question, questionResult.update);
+      await question.save();
+    }
+
+    let answerKey = null;
+    if (Object.keys(answerKeyResult.update).length > 0) {
+      answerKey = await AnswerKey.findOneAndUpdate(
+        { questionId },
+        { $set: { ...answerKeyResult.update, questionId } },
+        { new: true, upsert: true },
+      ).lean();
+    } else {
+      answerKey = await AnswerKey.findOne({ questionId }).lean();
+    }
+
+    return res.status(200).json({
+      message: "Question bank updated successfully",
+      question: question.toObject(),
+      answerKey: answerKey || null,
+    });
+  } catch (error) {
+    console.error("Update admin question bank error:", error);
+    return res.status(500).json({ message: "Server Error" });
+  }
+});
+
+app.put("/api/admin/answerkeys/:questionId", verifyToken, verifyAdmin, verifyAdminPanelSecret, async (req, res) => {
+  try {
+    const { questionId } = req.params;
+    if (!mongoose.Types.ObjectId.isValid(questionId)) {
+      return res.status(400).json({ message: "Invalid questionId" });
+    }
+
+    const questionExists = await Question.exists({ _id: questionId });
+    if (!questionExists) {
+      return res.status(404).json({ message: "Question not found" });
+    }
+
+    const answerKeyResult = buildAnswerKeyUpdate(req.body);
+    if (answerKeyResult.error) {
+      return res.status(400).json({ message: answerKeyResult.error });
+    }
+
+    if (Object.keys(answerKeyResult.update).length === 0) {
+      return res.status(400).json({ message: "No answer key fields provided" });
+    }
+
+    const answerKey = await AnswerKey.findOneAndUpdate(
+      { questionId },
+      { $set: { ...answerKeyResult.update, questionId } },
+      { new: true, upsert: true },
+    ).lean();
+
+    return res.status(200).json({
+      message: "Answer key updated successfully",
+      answerKey,
+    });
+  } catch (error) {
+    console.error("Update admin answer key error:", error);
+    return res.status(500).json({ message: "Server Error" });
+  }
+});
+
+app.post("/api/admin/question-bank/bulk-import", verifyToken, verifyAdmin, verifyAdminPanelSecret, async (req, res) => {
+  try {
+    const topicId = String(req.body?.topicId || "").trim();
+    const syllabusId = String(req.body?.syllabusId || "").trim();
+    const items = Array.isArray(req.body?.questions) ? req.body.questions : [];
+
+    if (!mongoose.Types.ObjectId.isValid(topicId)) {
+      return res.status(400).json({ message: "Invalid topicId" });
+    }
+    if (!mongoose.Types.ObjectId.isValid(syllabusId)) {
+      return res.status(400).json({ message: "Invalid syllabusId" });
+    }
+    if (items.length === 0) {
+      return res.status(400).json({ message: "questions must be a non-empty array" });
+    }
+
+    const errors = [];
+    let createdCount = 0;
+    let answerKeyUpserts = 0;
+
+    for (let index = 0; index < items.length; index += 1) {
+      const item = items[index] || {};
+      const createResult = buildQuestionCreate({
+        ...item,
+        topicId,
+        syllabusId,
+      });
+
+      if (createResult.error) {
+        errors.push({ index, message: createResult.error });
+        continue;
+      }
+
+      const question = await Question.create(createResult.payload);
+      createdCount += 1;
+
+      const answerKeyResult = buildAnswerKeyUpdate(item);
+      if (answerKeyResult.error) {
+        errors.push({ index, message: answerKeyResult.error });
+        continue;
+      }
+
+      if (Object.keys(answerKeyResult.update).length > 0) {
+        await AnswerKey.findOneAndUpdate(
+          { questionId: question._id },
+          { $set: { ...answerKeyResult.update, questionId: question._id } },
+          { new: true, upsert: true },
+        ).lean();
+        answerKeyUpserts += 1;
+      }
+    }
+
+    return res.status(200).json({
+      message: "Bulk import completed",
+      total: items.length,
+      createdCount,
+      answerKeyUpserts,
+      failedCount: errors.length,
+      errors,
+    });
+  } catch (error) {
+    console.error("Bulk import admin question bank error:", error);
+    return res.status(500).json({ message: "Server Error" });
+  }
 });
 
 app.get("/api/admin/registration-audit-logs", verifyToken, verifyAdmin, verifyAdminPanelSecret, async (req, res) => {

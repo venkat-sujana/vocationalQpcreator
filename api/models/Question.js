@@ -37,7 +37,23 @@ const questionSchema = new mongoose.Schema({
   boardFrequency: {
     type: Number,
     default: 0
+  },
+
+  isDeleted: {
+    type: Boolean,
+    default: false,
+    index: true,
+  },
+
+  deletedAt: {
+    type: Date,
+    default: null,
+  },
+
+  deletedBy: {
+    type: String,
+    default: "",
   }
-});
+}, { timestamps: true });
 
 export default mongoose.model("Question", questionSchema);
