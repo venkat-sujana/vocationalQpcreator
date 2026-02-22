@@ -1,7 +1,15 @@
 // backend/models/AnswerKey.js
 import mongoose from "mongoose";
 
+const allowedGroupCodes = ["MAT", "CET", "MLT", "ET"];
+
 const answerKeySchema = new mongoose.Schema({
+  groupCode: {
+    type: String,
+    enum: allowedGroupCodes,
+    default: "MAT",
+    index: true,
+  },
   questionId: {
     type: mongoose.Schema.Types.ObjectId,
     ref: "Question",
@@ -37,5 +45,7 @@ const answerKeySchema = new mongoose.Schema({
 
   note: String
 });
+
+answerKeySchema.index({ groupCode: 1, questionId: 1 });
 
 export default mongoose.model("AnswerKey", answerKeySchema);

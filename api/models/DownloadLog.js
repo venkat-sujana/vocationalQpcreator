@@ -1,7 +1,15 @@
 import mongoose from "mongoose";
 
+const allowedGroupCodes = ["MAT", "CET", "MLT", "ET"];
+
 const downloadLogSchema = new mongoose.Schema(
   {
+    groupCode: {
+      type: String,
+      enum: allowedGroupCodes,
+      default: "MAT",
+      index: true,
+    },
     userId: {
       type: mongoose.Schema.Types.ObjectId,
       ref: "Lecturer",
@@ -84,5 +92,6 @@ const downloadLogSchema = new mongoose.Schema(
 downloadLogSchema.index({ userId: 1, createdAt: -1 });
 downloadLogSchema.index({ downloadType: 1, createdAt: -1 });
 downloadLogSchema.index({ email: 1, date: -1 });
+downloadLogSchema.index({ groupCode: 1, createdAt: -1 });
 
 export default mongoose.model("DownloadLog", downloadLogSchema);

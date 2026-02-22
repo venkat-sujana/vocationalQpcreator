@@ -6,6 +6,7 @@ import cookieParser from "cookie-parser";
 import jwt from "jsonwebtoken";
 import bcrypt from "bcryptjs";
 import express from "express";
+import mongoose from "mongoose";
 import helmet from "helmet";
 import { rateLimit } from "express-rate-limit";
 import { connectDB } from "./db.js";
@@ -17,6 +18,8 @@ import AnswerKey from "./models/AnswerKey.js";
 import Lecturer from "./models/Lecturer.js";
 import DownloadLog from "./models/DownloadLog.js";
 import RegistrationAuditLog from "./models/RegistrationAuditLog.js";
+import { resolveGroupRules } from "./config/groupRules.js";
+import { buildAnswerKey, buildQuestionSet, toPaperQuestion } from "./services/groupPaperService.js";
 
 // IMAGE UPLOAD IMPORTS  🔑
 import multer from "multer";
@@ -271,6 +274,7 @@ app.post("/api/auth/login", authLimiter, async (req, res) => {
 
     return res.status(200).json({
       message: "Login successful",
+      token,
       user: {
         name: lecturer.name,
         email: lecturer.email,
@@ -301,7 +305,11 @@ const verifyToken = (req, res, next) => {
   console.log("Checking token...");
   console.log("Cookies:", req.cookies);
 
-  const token = req.cookies.token;
+  const authHeader = String(req.get("authorization") || "").trim();
+  const bearerToken = authHeader.toLowerCase().startsWith("bearer ")
+    ? authHeader.slice(7).trim()
+    : "";
+  const token = req.cookies?.token || bearerToken || String(req.get("x-access-token") || "").trim();
 
   if (!token) {
     console.log("No token found");
@@ -346,8 +354,76 @@ const normalizeParagraphs = (value) => {
     .filter(Boolean);
 };
 
+const DEFAULT_GROUP_CODE = "MAT";
+const ALLOWED_GROUP_CODES = ["MAT", "CET", "MLT", "ET"];
+const GROUP_CODE_ALIASES = {
+  "M&AT": "MAT",
+  "M AT": "MAT",
+  "M-AT": "MAT",
+};
+
+const normalizeGroupCode = (value, defaultGroupCode = DEFAULT_GROUP_CODE) => {
+  const raw = String(value || defaultGroupCode).trim().toUpperCase();
+  const normalized = GROUP_CODE_ALIASES[raw] || raw;
+  return ALLOWED_GROUP_CODES.includes(normalized) ? normalized : null;
+};
+
+const resolveLegacyOrRequestedGroup = (body = {}, query = {}) => {
+  const candidate = body.groupCode || query.groupCode;
+  return normalizeGroupCode(candidate, DEFAULT_GROUP_CODE) || DEFAULT_GROUP_CODE;
+};
+
+const validateGroupCodeOrDefault = (body = {}, query = {}) => {
+  const candidate = body.groupCode || query.groupCode;
+  const normalized = normalizeGroupCode(candidate, DEFAULT_GROUP_CODE);
+  if (!normalized) {
+    return {
+      error: {
+        status: 400,
+        message: `groupCode must be one of ${ALLOWED_GROUP_CODES.join(", ")}`,
+      },
+    };
+  }
+  return { groupCode: normalized };
+};
+
+const writeRouteMetric = ({ req, routeName, groupCode, statusCode, startedAt, result }) => {
+  const durationMs = Date.now() - startedAt;
+  const logPayload = {
+    event: "route_metric",
+    route: routeName,
+    method: req.method,
+    path: req.originalUrl,
+    groupCode: groupCode || DEFAULT_GROUP_CODE,
+    statusCode,
+    result,
+    durationMs,
+    at: new Date().toISOString(),
+  };
+  console.log(JSON.stringify(logPayload));
+};
+
+const parseGenerationCriteria = (payload = {}) => {
+  const criteria = {};
+  const optionalKeys = ["topicId", "syllabusId", "questionType", "marks", "limit", "shuffle", "includeDeleted"];
+  for (const key of optionalKeys) {
+    if (Object.prototype.hasOwnProperty.call(payload, key)) {
+      criteria[key] = payload[key];
+    }
+  }
+  return criteria;
+};
+
 const buildQuestionUpdate = (body = {}) => {
   const update = {};
+
+  if (Object.prototype.hasOwnProperty.call(body, "groupCode")) {
+    const groupCode = normalizeGroupCode(body.groupCode, DEFAULT_GROUP_CODE);
+    if (!groupCode) {
+      return { error: `groupCode must be one of ${ALLOWED_GROUP_CODES.join(", ")}` };
+    }
+    update.groupCode = groupCode;
+  }
 
   if (Object.prototype.hasOwnProperty.call(body, "questionTextEn")) {
     const questionTextEn = normalizeText(body.questionTextEn);
@@ -393,6 +469,7 @@ const buildQuestionUpdate = (body = {}) => {
 };
 
 const buildQuestionCreate = (body = {}) => {
+  const groupCode = normalizeGroupCode(body.groupCode, DEFAULT_GROUP_CODE);
   const syllabusId = String(body.syllabusId || "").trim();
   const topicId = String(body.topicId || "").trim();
   const questionTextEn = normalizeText(body.questionTextEn);
@@ -403,6 +480,9 @@ const buildQuestionCreate = (body = {}) => {
     ? Number(body.boardFrequency)
     : 0;
 
+  if (!groupCode) {
+    return { error: `groupCode must be one of ${ALLOWED_GROUP_CODES.join(", ")}` };
+  }
   if (!mongoose.Types.ObjectId.isValid(syllabusId)) {
     return { error: "Invalid syllabusId" };
   }
@@ -427,6 +507,7 @@ const buildQuestionCreate = (body = {}) => {
 
   return {
     payload: {
+      groupCode,
       syllabusId,
       topicId,
       questionTextEn,
@@ -443,6 +524,14 @@ const buildAnswerKeyUpdate = (body = {}) => {
     ? body.answerKey
     : body;
   const update = {};
+
+  if (Object.prototype.hasOwnProperty.call(answerPayload, "groupCode")) {
+    const groupCode = normalizeGroupCode(answerPayload.groupCode, DEFAULT_GROUP_CODE);
+    if (!groupCode) {
+      return { error: `groupCode must be one of ${ALLOWED_GROUP_CODES.join(", ")}` };
+    }
+    update.groupCode = groupCode;
+  }
 
   if (Object.prototype.hasOwnProperty.call(answerPayload, "marks")) {
     const marks = Number(answerPayload.marks);
@@ -515,6 +604,7 @@ const logDownloadEvent = async (req, data) => {
     }
 
     await DownloadLog.create({
+      groupCode: normalizeGroupCode(data.groupCode, DEFAULT_GROUP_CODE) || DEFAULT_GROUP_CODE,
       userId: req.user?.id,
       lecturerName: req.user?.name,
       email: req.user?.email,
@@ -578,6 +668,30 @@ app.post("/api/upload/diagram", upload.single("diagram"), (req, res) => {
 });
 
 /* ADD SYLLABUS */
+app.post("/api/syllabus", async (req, res) => {
+  try {
+    const groupCode = resolveLegacyOrRequestedGroup(req.body);
+    const payload = {
+      groupCode,
+      board: normalizeText(req.body?.board),
+      course: normalizeText(req.body?.course),
+      courseCode: normalizeText(req.body?.courseCode),
+      group: normalizeText(req.body?.group),
+      year: normalizeText(req.body?.year),
+      subject: normalizeText(req.body?.subject),
+      subjectCode: normalizeText(req.body?.subjectCode),
+    };
+
+    if (!payload.year || !payload.subject) {
+      return res.status(400).json({ message: "year and subject are required" });
+    }
+
+    const syllabus = await Syllabus.create(payload);
+    return res.status(201).json(syllabus);
+  } catch (err) {
+    return res.status(500).json({ error: err.message });
+  }
+});
 
 app.get("/api/syllabus", async (req, res) => {
   try {
@@ -598,19 +712,194 @@ app.get("/api/syllabus", async (req, res) => {
 app.post("/api/topics", async (req, res) => {
   try {
     console.log("Received topic data:", req.body);
-    const topic = await Topic.create(req.body);
+    const groupCode = resolveLegacyOrRequestedGroup(req.body);
+    const topic = await Topic.create({
+      ...req.body,
+      groupCode,
+    });
     res.status(201).json(topic);
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
 });
 
+/* BULK ADD TOPICS */
+app.post("/api/topics/bulk", async (req, res) => {
+  try {
+    const payload = Array.isArray(req.body) ? req.body : req.body?.topics;
+    if (!Array.isArray(payload) || payload.length === 0) {
+      return res.status(400).json({ message: "topics must be a non-empty array" });
+    }
+
+    const errors = [];
+    const documents = [];
+
+    for (let index = 0; index < payload.length; index += 1) {
+      const item = payload[index] || {};
+      const groupCode = resolveLegacyOrRequestedGroup(item);
+      const syllabusId = String(item.syllabusId || "").trim();
+      const topicName = normalizeText(item.topicName);
+      const unitName = normalizeText(item.unitName);
+      const unitNo = Number(item.unitNo);
+
+      if (!mongoose.Types.ObjectId.isValid(syllabusId)) {
+        errors.push({ index, message: "Invalid syllabusId" });
+        continue;
+      }
+      if (!topicName) {
+        errors.push({ index, message: "topicName is required" });
+        continue;
+      }
+      if (!Number.isFinite(unitNo) || unitNo <= 0) {
+        errors.push({ index, message: "unitNo must be a positive number" });
+        continue;
+      }
+
+      const syllabus = await Syllabus.findById(syllabusId).select("groupCode").lean();
+      if (!syllabus) {
+        errors.push({ index, message: "syllabus not found" });
+        continue;
+      }
+      if (syllabus.groupCode && syllabus.groupCode !== groupCode) {
+        errors.push({ index, message: "syllabusId does not belong to requested groupCode" });
+        continue;
+      }
+
+      documents.push({
+        groupCode,
+        syllabusId,
+        unitNo,
+        unitName,
+        topicName,
+      });
+    }
+
+    if (documents.length === 0) {
+      return res.status(400).json({
+        message: "No valid topics to insert",
+        failedCount: errors.length,
+        errors,
+      });
+    }
+
+    const inserted = await Topic.insertMany(documents, { ordered: false });
+    return res.status(201).json({
+      message: "Topics bulk insert completed",
+      total: payload.length,
+      createdCount: inserted.length,
+      failedCount: errors.length,
+      errors,
+      topics: inserted,
+    });
+  } catch (err) {
+    return res.status(500).json({ error: err.message });
+  }
+});
+
 /* GET TOPICS BY SYLLABUS ID */
 app.get("/api/topics/:syllabusId", async (req, res) => {
   try {
-    const topics = await Topic.find({
-      syllabusId: req.params.syllabusId,
-    });
+    const extractIdString = (value) => {
+      if (!value) return "";
+      if (typeof value === "string") return value.trim();
+      if (value instanceof mongoose.Types.ObjectId) return String(value);
+      if (typeof value === "object") {
+        if (typeof value.$oid === "string") return value.$oid.trim();
+        if (typeof value.toHexString === "function") return String(value.toHexString()).trim();
+        if (typeof value.toString === "function") {
+          const text = String(value.toString()).trim();
+          if (text && text !== "[object Object]") return text;
+        }
+      }
+      return "";
+    };
+
+    const buildIdMatches = (field, rawId) => {
+      const id = extractIdString(rawId);
+      if (!id) return [];
+      const matches = [{ [field]: id }, { [`${field}.$oid`]: id }];
+      if (mongoose.Types.ObjectId.isValid(id)) {
+        matches.push({ [field]: new mongoose.Types.ObjectId(id) });
+      }
+      return matches;
+    };
+
+    const rawSyllabusId = String(req.params.syllabusId || "").trim();
+    const syllabusIdQuery = buildIdMatches("syllabusId", rawSyllabusId);
+
+    const query = {
+      $or: syllabusIdQuery,
+    };
+    const normalizedGroup = normalizeGroupCode(req.query.groupCode);
+    const applyGroupFilter = (baseQuery) => {
+      if (!normalizedGroup) return baseQuery;
+      if (normalizedGroup === DEFAULT_GROUP_CODE) {
+        return {
+          $and: [
+            baseQuery,
+            {
+              $or: [
+                { groupCode: DEFAULT_GROUP_CODE },
+                { groupCode: { $exists: false } },
+                { groupCode: null },
+                { groupCode: "" },
+              ],
+            },
+          ],
+        };
+      }
+      return { ...baseQuery, groupCode: normalizedGroup };
+    };
+
+    let topics = await Topic.find(applyGroupFilter(query));
+
+    // Fallback for duplicated/migrated syllabus documents where topics may be linked
+    // to a sibling syllabus record with same subject/year/group.
+    if (topics.length === 0) {
+      const selectedSyllabus = await Syllabus.findOne({
+        $or: buildIdMatches("_id", rawSyllabusId),
+      }).lean();
+      if (selectedSyllabus) {
+        const siblingSyllabusQuery = {
+          subject: selectedSyllabus.subject,
+          year: selectedSyllabus.year,
+        };
+        if (selectedSyllabus.groupCode) {
+          siblingSyllabusQuery.groupCode = selectedSyllabus.groupCode;
+        } else if (selectedSyllabus.group) {
+          siblingSyllabusQuery.group = selectedSyllabus.group;
+        }
+
+        const siblingSyllabi = await Syllabus.find(siblingSyllabusQuery).select("_id").lean();
+        const siblingIds = siblingSyllabi
+          .map((item) => extractIdString(item._id))
+          .filter(Boolean);
+
+        if (siblingIds.length > 0) {
+          const fallbackQuery = {
+            $or: siblingIds.flatMap((id) => buildIdMatches("syllabusId", id)),
+          };
+          topics = await Topic.find(applyGroupFilter(fallbackQuery));
+        }
+
+        // Final fallback: subject-only sibling lookup to handle legacy year/group drift.
+        if (topics.length === 0 && selectedSyllabus.subject) {
+          const subjectSiblings = await Syllabus.find({ subject: selectedSyllabus.subject })
+            .select("_id")
+            .lean();
+          const subjectSiblingIds = subjectSiblings
+            .map((item) => extractIdString(item._id))
+            .filter(Boolean);
+          if (subjectSiblingIds.length > 0) {
+            const subjectFallbackQuery = {
+              $or: subjectSiblingIds.flatMap((id) => buildIdMatches("syllabusId", id)),
+            };
+            topics = await Topic.find(applyGroupFilter(subjectFallbackQuery));
+          }
+        }
+      }
+    }
+
     res.json(topics);
   } catch (err) {
     res.status(500).json({ error: err.message });
@@ -625,6 +914,24 @@ app.post("/api/questions", async (req, res) => {
     if (createResult.error) {
       return res.status(400).json({ error: createResult.error });
     }
+
+    const [topic, syllabus] = await Promise.all([
+      Topic.findById(createResult.payload.topicId).select("groupCode").lean(),
+      Syllabus.findById(createResult.payload.syllabusId).select("groupCode").lean(),
+    ]);
+
+    if (!topic || !syllabus) {
+      return res.status(400).json({ error: "Invalid topicId or syllabusId" });
+    }
+
+    const resolvedGroupCode = createResult.payload.groupCode || DEFAULT_GROUP_CODE;
+    if (topic.groupCode && topic.groupCode !== resolvedGroupCode) {
+      return res.status(400).json({ error: "topicId does not belong to requested groupCode" });
+    }
+    if (syllabus.groupCode && syllabus.groupCode !== resolvedGroupCode) {
+      return res.status(400).json({ error: "syllabusId does not belong to requested groupCode" });
+    }
+
     const question = await Question.create(createResult.payload);
     res.status(201).json(question);
   } catch (err) {
@@ -635,10 +942,15 @@ app.post("/api/questions", async (req, res) => {
 /* GET QUESTIONS BY TOPIC ID */
 app.get("/api/questions/topic/:topicId", async (req, res) => {
   try {
-    const questions = await Question.find({
+    const query = {
       topicId: req.params.topicId,
       isDeleted: { $ne: true },
-    });
+    };
+    const normalizedGroup = normalizeGroupCode(req.query.groupCode);
+    if (normalizedGroup) {
+      query.groupCode = normalizedGroup;
+    }
+    const questions = await Question.find(query);
     res.json(questions);
   } catch (err) {
     res.status(500).json({ error: err.message });
@@ -665,10 +977,29 @@ app.post("/api/answerkeys", async (req, res) => {
         });
       }
 
+      const question = await Question.findById(key.questionId).select("groupCode").lean();
+      if (!question) {
+        return res.status(400).json({
+          error: `Question not found for questionId: ${key.questionId}`,
+        });
+      }
+
+      const resolvedGroupCode = normalizeGroupCode(key.groupCode, question.groupCode || DEFAULT_GROUP_CODE);
+      if (!resolvedGroupCode) {
+        return res.status(400).json({
+          error: `Invalid groupCode for questionId: ${key.questionId}`,
+        });
+      }
+      if (question.groupCode && question.groupCode !== resolvedGroupCode) {
+        return res.status(400).json({
+          error: `questionId ${key.questionId} does not belong to groupCode ${resolvedGroupCode}`,
+        });
+      }
+
       operations.push({
         updateOne: {
           filter: { questionId: key.questionId },
-          update: { $set: key },
+          update: { $set: { ...key, groupCode: resolvedGroupCode } },
           upsert: true,
         },
       });
@@ -700,7 +1031,6 @@ app.get("/api/answerkeys/:questionId", verifyToken, async (req, res) => {
 });
 
 // GENERATE KEY PAPER FOR A TOPIC
-import mongoose from "mongoose";
 
 app.get("/api/keypaper/topic/:topicId", verifyToken, async (req, res) => {
   try {
@@ -732,6 +1062,7 @@ app.get("/api/keypaper/topic/:topicId", verifyToken, async (req, res) => {
       downloadType: "keypaper_topic",
       topicId: req.params.topicId,
       questionCount: keyPaper.length,
+      groupCode: questions[0]?.groupCode || DEFAULT_GROUP_CODE,
     });
 
     res.json(keyPaper);
@@ -791,6 +1122,7 @@ app.post("/api/keypaper/questions", verifyToken, async (req, res) => {
       downloadType: "keypaper_questions",
       topicId: resolvedTopicId,
       questionCount: keyPaper.length,
+      groupCode: questions[0]?.groupCode || DEFAULT_GROUP_CODE,
     });
 
     res.json(keyPaper);
@@ -812,6 +1144,7 @@ app.post("/api/questionpaper/download-log", verifyToken, async (req, res) => {
 
     await logDownloadEvent(req, {
       downloadType: "questionpaper_pdf",
+      groupCode: resolveLegacyOrRequestedGroup(req.body),
       paperType: String(paperType || "").trim(),
       subject: String(subject || "").trim(),
       examName: String(examName || "").trim(),
@@ -823,6 +1156,162 @@ app.post("/api/questionpaper/download-log", verifyToken, async (req, res) => {
     return res.status(201).json({ message: "Question paper download logged" });
   } catch (error) {
     console.error("Question paper download log error:", error);
+    return res.status(500).json({ message: "Server Error" });
+  }
+});
+
+app.post("/api/v2/papers/generate", async (req, res) => {
+  const startedAt = Date.now();
+  const groupValidation = validateGroupCodeOrDefault(req.body);
+  if (groupValidation.error) {
+    writeRouteMetric({
+      req,
+      routeName: "/api/v2/papers/generate",
+      groupCode: req.body?.groupCode,
+      statusCode: groupValidation.error.status,
+      startedAt,
+      result: "validation_error",
+    });
+    return res.status(groupValidation.error.status).json({ message: groupValidation.error.message });
+  }
+
+  const { groupCode } = groupValidation;
+  const resolved = resolveGroupRules(groupCode);
+  if (resolved.error) {
+    writeRouteMetric({
+      req,
+      routeName: "/api/v2/papers/generate",
+      groupCode,
+      statusCode: resolved.error.status,
+      startedAt,
+      result: resolved.error.code,
+    });
+    return res.status(resolved.error.status).json({ code: resolved.error.code, message: resolved.error.message });
+  }
+
+  try {
+    const criteria = parseGenerationCriteria(req.body || {});
+    const questionSetResult = await buildQuestionSet(criteria, resolved.rules);
+    if (questionSetResult.error) {
+      writeRouteMetric({
+        req,
+        routeName: "/api/v2/papers/generate",
+        groupCode,
+        statusCode: questionSetResult.error.status,
+        startedAt,
+        result: questionSetResult.error.code,
+      });
+      return res.status(questionSetResult.error.status).json(questionSetResult.error);
+    }
+
+    const questions = questionSetResult.questionSet.map((question) => toPaperQuestion(question));
+
+    writeRouteMetric({
+      req,
+      routeName: "/api/v2/papers/generate",
+      groupCode,
+      statusCode: 200,
+      startedAt,
+      result: "success",
+    });
+
+    return res.status(200).json({
+      groupCode,
+      paperMeta: questionSetResult.paperMeta,
+      questions,
+    });
+  } catch (error) {
+    console.error("Generate v2 question paper error:", error);
+    writeRouteMetric({
+      req,
+      routeName: "/api/v2/papers/generate",
+      groupCode,
+      statusCode: 500,
+      startedAt,
+      result: "server_error",
+    });
+    return res.status(500).json({ message: "Server Error" });
+  }
+});
+
+app.post("/api/v2/answer-keys/generate", verifyToken, async (req, res) => {
+  const startedAt = Date.now();
+  const groupValidation = validateGroupCodeOrDefault(req.body);
+  if (groupValidation.error) {
+    writeRouteMetric({
+      req,
+      routeName: "/api/v2/answer-keys/generate",
+      groupCode: req.body?.groupCode,
+      statusCode: groupValidation.error.status,
+      startedAt,
+      result: "validation_error",
+    });
+    return res.status(groupValidation.error.status).json({ message: groupValidation.error.message });
+  }
+
+  const { groupCode } = groupValidation;
+  const resolved = resolveGroupRules(groupCode);
+  if (resolved.error) {
+    writeRouteMetric({
+      req,
+      routeName: "/api/v2/answer-keys/generate",
+      groupCode,
+      statusCode: resolved.error.status,
+      startedAt,
+      result: resolved.error.code,
+    });
+    return res.status(resolved.error.status).json({ code: resolved.error.code, message: resolved.error.message });
+  }
+
+  try {
+    const criteria = parseGenerationCriteria(req.body || {});
+    const questionSetResult = await buildQuestionSet(criteria, resolved.rules);
+    if (questionSetResult.error) {
+      writeRouteMetric({
+        req,
+        routeName: "/api/v2/answer-keys/generate",
+        groupCode,
+        statusCode: questionSetResult.error.status,
+        startedAt,
+        result: questionSetResult.error.code,
+      });
+      return res.status(questionSetResult.error.status).json(questionSetResult.error);
+    }
+
+    const answerKeyPayload = await buildAnswerKey(questionSetResult.questionSet, resolved.rules);
+
+    await logDownloadEvent(req, {
+      groupCode,
+      downloadType: "keypaper_v2_generate",
+      topicId: criteria.topicId && mongoose.Types.ObjectId.isValid(criteria.topicId) ? criteria.topicId : null,
+      questionCount: answerKeyPayload.meta.questionCount,
+      paperType: "answer_key",
+    });
+
+    writeRouteMetric({
+      req,
+      routeName: "/api/v2/answer-keys/generate",
+      groupCode,
+      statusCode: 200,
+      startedAt,
+      result: "success",
+    });
+
+    return res.status(200).json({
+      groupCode,
+      paperMeta: questionSetResult.paperMeta,
+      secureKeyPayload: answerKeyPayload,
+    });
+  } catch (error) {
+    console.error("Generate v2 answer key error:", error);
+    writeRouteMetric({
+      req,
+      routeName: "/api/v2/answer-keys/generate",
+      groupCode,
+      statusCode: 500,
+      startedAt,
+      result: "server_error",
+    });
     return res.status(500).json({ message: "Server Error" });
   }
 });
@@ -844,10 +1333,16 @@ app.get("/api/download-logs", verifyToken, async (req, res) => {
     if (req.query.topicId && mongoose.Types.ObjectId.isValid(req.query.topicId)) {
       query.topicId = req.query.topicId;
     }
+    if (req.query.groupCode) {
+      const groupCode = normalizeGroupCode(req.query.groupCode);
+      if (groupCode) {
+        query.groupCode = groupCode;
+      }
+    }
 
     const [logs, total] = await Promise.all([
       DownloadLog.find(query)
-        .select("lecturerName email collegeName topicId date IP downloadType questionCount paperType subject examName academicYear examSession")
+        .select("groupCode lecturerName email collegeName topicId date IP downloadType questionCount paperType subject examName academicYear examSession")
         .sort({ createdAt: -1 })
         .skip(skip)
         .limit(limit)
@@ -857,6 +1352,7 @@ app.get("/api/download-logs", verifyToken, async (req, res) => {
 
     const formattedLogs = logs.map((log) => ({
       lecturerName: log.lecturerName || "",
+      groupCode: log.groupCode || DEFAULT_GROUP_CODE,
       email: log.email || "",
       collegeName: log.collegeName || "",
       topicId: log.topicId || null,
@@ -899,6 +1395,12 @@ app.get("/api/admin/download-logs", verifyToken, verifyAdmin, verifyAdminPanelSe
     if (req.query.topicId && mongoose.Types.ObjectId.isValid(req.query.topicId)) {
       query.topicId = req.query.topicId;
     }
+    if (req.query.groupCode) {
+      const groupCode = normalizeGroupCode(req.query.groupCode);
+      if (groupCode) {
+        query.groupCode = groupCode;
+      }
+    }
 
     if (req.query.email) {
       query.email = String(req.query.email).trim().toLowerCase();
@@ -932,7 +1434,7 @@ app.get("/api/admin/download-logs", verifyToken, verifyAdmin, verifyAdminPanelSe
 
     const [logs, total] = await Promise.all([
       DownloadLog.find(query)
-        .select("lecturerName email collegeName topicId date IP downloadType questionCount paperType subject examName academicYear examSession")
+        .select("groupCode lecturerName email collegeName topicId date IP downloadType questionCount paperType subject examName academicYear examSession")
         .sort({ date: -1, createdAt: -1 })
         .skip(skip)
         .limit(limit)
@@ -942,6 +1444,7 @@ app.get("/api/admin/download-logs", verifyToken, verifyAdmin, verifyAdminPanelSe
 
     const formattedLogs = logs.map((log) => ({
       lecturerName: log.lecturerName || "",
+      groupCode: log.groupCode || DEFAULT_GROUP_CODE,
       email: log.email || "",
       collegeName: log.collegeName || "",
       topicId: log.topicId || null,
@@ -982,6 +1485,10 @@ app.get("/api/admin/question-bank/topic/:topicId", verifyToken, verifyAdmin, ver
 
     const includeDeleted = String(req.query.includeDeleted || "").trim().toLowerCase() === "true";
     const query = { topicId };
+    const groupCode = normalizeGroupCode(req.query.groupCode);
+    if (groupCode) {
+      query.groupCode = groupCode;
+    }
     if (!includeDeleted) {
       query.isDeleted = { $ne: true };
     }
@@ -1013,6 +1520,21 @@ app.post("/api/admin/question-bank", verifyToken, verifyAdmin, verifyAdminPanelS
       return res.status(400).json({ message: createResult.error });
     }
 
+    const [topic, syllabus] = await Promise.all([
+      Topic.findById(createResult.payload.topicId).select("groupCode").lean(),
+      Syllabus.findById(createResult.payload.syllabusId).select("groupCode").lean(),
+    ]);
+    if (!topic || !syllabus) {
+      return res.status(400).json({ message: "Invalid topicId or syllabusId" });
+    }
+    const resolvedGroupCode = createResult.payload.groupCode || DEFAULT_GROUP_CODE;
+    if (topic.groupCode && topic.groupCode !== resolvedGroupCode) {
+      return res.status(400).json({ message: "topicId does not belong to requested groupCode" });
+    }
+    if (syllabus.groupCode && syllabus.groupCode !== resolvedGroupCode) {
+      return res.status(400).json({ message: "syllabusId does not belong to requested groupCode" });
+    }
+
     const question = await Question.create(createResult.payload);
     let answerKey = null;
 
@@ -1024,7 +1546,7 @@ app.post("/api/admin/question-bank", verifyToken, verifyAdmin, verifyAdminPanelS
     if (Object.keys(answerKeyResult.update).length > 0) {
       answerKey = await AnswerKey.findOneAndUpdate(
         { questionId: question._id },
-        { $set: { ...answerKeyResult.update, questionId: question._id } },
+        { $set: { ...answerKeyResult.update, questionId: question._id, groupCode: question.groupCode || DEFAULT_GROUP_CODE } },
         { new: true, upsert: true },
       ).lean();
     }
@@ -1155,7 +1677,7 @@ app.put("/api/admin/question-bank/:questionId", verifyToken, verifyAdmin, verify
     if (Object.keys(answerKeyResult.update).length > 0) {
       answerKey = await AnswerKey.findOneAndUpdate(
         { questionId },
-        { $set: { ...answerKeyResult.update, questionId } },
+        { $set: { ...answerKeyResult.update, questionId, groupCode: question.groupCode || DEFAULT_GROUP_CODE } },
         { new: true, upsert: true },
       ).lean();
     } else {
@@ -1185,6 +1707,7 @@ app.put("/api/admin/answerkeys/:questionId", verifyToken, verifyAdmin, verifyAdm
       return res.status(404).json({ message: "Question not found" });
     }
 
+    const question = await Question.findById(questionId).select("groupCode").lean();
     const answerKeyResult = buildAnswerKeyUpdate(req.body);
     if (answerKeyResult.error) {
       return res.status(400).json({ message: answerKeyResult.error });
@@ -1196,7 +1719,7 @@ app.put("/api/admin/answerkeys/:questionId", verifyToken, verifyAdmin, verifyAdm
 
     const answerKey = await AnswerKey.findOneAndUpdate(
       { questionId },
-      { $set: { ...answerKeyResult.update, questionId } },
+      { $set: { ...answerKeyResult.update, questionId, groupCode: question?.groupCode || DEFAULT_GROUP_CODE } },
       { new: true, upsert: true },
     ).lean();
 
@@ -1214,6 +1737,7 @@ app.post("/api/admin/question-bank/bulk-import", verifyToken, verifyAdmin, verif
   try {
     const topicId = String(req.body?.topicId || "").trim();
     const syllabusId = String(req.body?.syllabusId || "").trim();
+    const groupCode = normalizeGroupCode(req.body?.groupCode, DEFAULT_GROUP_CODE) || DEFAULT_GROUP_CODE;
     const items = Array.isArray(req.body?.questions) ? req.body.questions : [];
 
     if (!mongoose.Types.ObjectId.isValid(topicId)) {
@@ -1226,6 +1750,20 @@ app.post("/api/admin/question-bank/bulk-import", verifyToken, verifyAdmin, verif
       return res.status(400).json({ message: "questions must be a non-empty array" });
     }
 
+    const [topic, syllabus] = await Promise.all([
+      Topic.findById(topicId).select("groupCode").lean(),
+      Syllabus.findById(syllabusId).select("groupCode").lean(),
+    ]);
+    if (!topic || !syllabus) {
+      return res.status(400).json({ message: "Invalid topicId or syllabusId" });
+    }
+    if (topic.groupCode && topic.groupCode !== groupCode) {
+      return res.status(400).json({ message: "topicId does not belong to requested groupCode" });
+    }
+    if (syllabus.groupCode && syllabus.groupCode !== groupCode) {
+      return res.status(400).json({ message: "syllabusId does not belong to requested groupCode" });
+    }
+
     const errors = [];
     let createdCount = 0;
     let answerKeyUpserts = 0;
@@ -1236,6 +1774,7 @@ app.post("/api/admin/question-bank/bulk-import", verifyToken, verifyAdmin, verif
         ...item,
         topicId,
         syllabusId,
+        groupCode,
       });
 
       if (createResult.error) {
@@ -1255,7 +1794,7 @@ app.post("/api/admin/question-bank/bulk-import", verifyToken, verifyAdmin, verif
       if (Object.keys(answerKeyResult.update).length > 0) {
         await AnswerKey.findOneAndUpdate(
           { questionId: question._id },
-          { $set: { ...answerKeyResult.update, questionId: question._id } },
+          { $set: { ...answerKeyResult.update, questionId: question._id, groupCode: question.groupCode || groupCode } },
           { new: true, upsert: true },
         ).lean();
         answerKeyUpserts += 1;
@@ -1364,4 +1903,3 @@ app.get("/api/admin/registration-audit-logs", verifyToken, verifyAdmin, verifyAd
 });
 
 export default app;
-

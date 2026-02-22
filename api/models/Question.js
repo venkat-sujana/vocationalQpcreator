@@ -1,6 +1,14 @@
 // backend/models/Question.js
 import mongoose from "mongoose";
+const allowedGroupCodes = ["MAT", "CET", "MLT", "ET"];
+
 const questionSchema = new mongoose.Schema({
+  groupCode: {
+    type: String,
+    enum: allowedGroupCodes,
+    default: "MAT",
+    index: true,
+  },
   syllabusId: {
     type: mongoose.Schema.Types.ObjectId,
     ref: "Syllabus",
@@ -55,5 +63,7 @@ const questionSchema = new mongoose.Schema({
     default: "",
   }
 }, { timestamps: true });
+
+questionSchema.index({ groupCode: 1, topicId: 1 });
 
 export default mongoose.model("Question", questionSchema);
