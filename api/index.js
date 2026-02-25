@@ -355,17 +355,23 @@ const normalizeParagraphs = (value) => {
 };
 
 const DEFAULT_GROUP_CODE = "MAT";
-const ALLOWED_GROUP_CODES = ["MAT", "CET", "MLT", "ET"];
+const BASE_GROUP_CODES = ["MAT", "CET", "MLT", "ET"];
+const CUSTOM_GROUP_CODE_PATTERN = /^[A-Z][A-Z0-9]{1,11}$/;
 const GROUP_CODE_ALIASES = {
   "M&AT": "MAT",
   "M AT": "MAT",
   "M-AT": "MAT",
 };
 
+const GROUP_CODE_HELP_MESSAGE = `groupCode must be one of ${BASE_GROUP_CODES.join(", ")} or a custom uppercase code (2-12 letters/numbers)`;
+
 const normalizeGroupCode = (value, defaultGroupCode = DEFAULT_GROUP_CODE) => {
   const raw = String(value || defaultGroupCode).trim().toUpperCase();
   const normalized = GROUP_CODE_ALIASES[raw] || raw;
-  return ALLOWED_GROUP_CODES.includes(normalized) ? normalized : null;
+  if (BASE_GROUP_CODES.includes(normalized)) {
+    return normalized;
+  }
+  return CUSTOM_GROUP_CODE_PATTERN.test(normalized) ? normalized : null;
 };
 
 const resolveLegacyOrRequestedGroup = (body = {}, query = {}) => {
@@ -380,7 +386,7 @@ const validateGroupCodeOrDefault = (body = {}, query = {}) => {
     return {
       error: {
         status: 400,
-        message: `groupCode must be one of ${ALLOWED_GROUP_CODES.join(", ")}`,
+        message: GROUP_CODE_HELP_MESSAGE,
       },
     };
   }
@@ -420,7 +426,7 @@ const buildQuestionUpdate = (body = {}) => {
   if (Object.prototype.hasOwnProperty.call(body, "groupCode")) {
     const groupCode = normalizeGroupCode(body.groupCode, DEFAULT_GROUP_CODE);
     if (!groupCode) {
-      return { error: `groupCode must be one of ${ALLOWED_GROUP_CODES.join(", ")}` };
+      return { error: GROUP_CODE_HELP_MESSAGE };
     }
     update.groupCode = groupCode;
   }
@@ -481,7 +487,7 @@ const buildQuestionCreate = (body = {}) => {
     : 0;
 
   if (!groupCode) {
-    return { error: `groupCode must be one of ${ALLOWED_GROUP_CODES.join(", ")}` };
+    return { error: GROUP_CODE_HELP_MESSAGE };
   }
   if (!mongoose.Types.ObjectId.isValid(syllabusId)) {
     return { error: "Invalid syllabusId" };
@@ -528,7 +534,7 @@ const buildAnswerKeyUpdate = (body = {}) => {
   if (Object.prototype.hasOwnProperty.call(answerPayload, "groupCode")) {
     const groupCode = normalizeGroupCode(answerPayload.groupCode, DEFAULT_GROUP_CODE);
     if (!groupCode) {
-      return { error: `groupCode must be one of ${ALLOWED_GROUP_CODES.join(", ")}` };
+      return { error: GROUP_CODE_HELP_MESSAGE };
     }
     update.groupCode = groupCode;
   }
@@ -1054,6 +1060,7 @@ app.get("/api/keypaper/topic/:topicId", verifyToken, async (req, res) => {
         answerTe: answerKey ? answerKey.answerParagraphsTe : [],
 
         diagramRequired: answerKey ? answerKey.diagramRequired : false,
+        diagramImageUrl: answerKey ? answerKey.diagramImageUrl : "",
         note: answerKey ? answerKey.note : "Answer not entered yet",
       });
     }
@@ -1107,6 +1114,7 @@ app.post("/api/keypaper/questions", verifyToken, async (req, res) => {
         answerEn: answerKey ? answerKey.answerParagraphsEn : [],
         answerTe: answerKey ? answerKey.answerParagraphsTe : [],
         diagramRequired: answerKey ? answerKey.diagramRequired : false,
+        diagramImageUrl: answerKey ? answerKey.diagramImageUrl : "",
         note: answerKey ? answerKey.note : "Answer not entered yet",
       });
     }

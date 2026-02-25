@@ -1,11 +1,14 @@
 // backend/models/Question.js
 import mongoose from "mongoose";
-const allowedGroupCodes = ["MAT", "CET", "MLT", "ET"];
+const groupCodePattern = /^[A-Z][A-Z0-9]{1,11}$/;
 
 const questionSchema = new mongoose.Schema({
   groupCode: {
     type: String,
-    enum: allowedGroupCodes,
+    validate: {
+      validator: (value) => groupCodePattern.test(String(value || "").trim().toUpperCase()),
+      message: "groupCode must be 2-12 uppercase letters/numbers",
+    },
     default: "MAT",
     index: true,
   },

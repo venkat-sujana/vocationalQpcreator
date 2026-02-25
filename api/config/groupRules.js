@@ -1,4 +1,5 @@
 const GROUP_CODES = ["MAT", "CET", "MLT", "ET"];
+const CUSTOM_GROUP_CODE_PATTERN = /^[A-Z][A-Z0-9]{1,11}$/;
 const GROUP_CODE_ALIASES = {
   "M&AT": "MAT",
   "M AT": "MAT",
@@ -59,12 +60,27 @@ const getFlagEnabledMap = () => ({
 const resolveGroupRules = (rawGroupCode) => {
   const normalizedRaw = String(rawGroupCode || "").trim().toUpperCase();
   const groupCode = GROUP_CODE_ALIASES[normalizedRaw] || normalizedRaw;
-  if (!GROUP_CODES.includes(groupCode)) {
+  const isKnownGroup = GROUP_CODES.includes(groupCode);
+  const isCustomGroup = !isKnownGroup && CUSTOM_GROUP_CODE_PATTERN.test(groupCode);
+
+  if (!isKnownGroup && !isCustomGroup) {
     return {
       error: {
         status: 400,
         code: "UNKNOWN_GROUP",
         message: `Unsupported groupCode: ${rawGroupCode}`,
+      },
+    };
+  }
+
+  if (isCustomGroup) {
+    const fallbackRules = GROUP_RULES.MAT;
+    return {
+      rules: {
+        ...fallbackRules,
+        groupCode,
+        isEnabled: true,
+        flagEnabled: true,
       },
     };
   }
