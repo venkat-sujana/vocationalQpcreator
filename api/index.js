@@ -1450,12 +1450,35 @@ app.get("/api/admin/download-logs", verifyToken, verifyAdmin, verifyAdminPanelSe
       DownloadLog.countDocuments(query),
     ]);
 
+    const topicIds = Array.from(
+      new Set(
+        logs
+          .map((log) => String(log?.topicId || "").trim())
+          .filter((id) => mongoose.Types.ObjectId.isValid(id)),
+      ),
+    );
+    const topics = topicIds.length
+      ? await Topic.find({ _id: { $in: topicIds } }).select("topicName unitName unitNo").lean()
+      : [];
+    const topicNameMap = new Map(
+      topics.map((topic) => {
+        const topicId = String(topic?._id || "");
+        const topicName = String(topic?.topicName || topic?.unitName || "").trim();
+        const unitNo = topic?.unitNo;
+        const label = unitNo !== undefined && unitNo !== null && String(unitNo).trim() !== ""
+          ? `Unit ${unitNo}: ${topicName || "Untitled Chapter"}`
+          : (topicName || "Untitled Chapter");
+        return [topicId, label];
+      }),
+    );
+
     const formattedLogs = logs.map((log) => ({
       lecturerName: log.lecturerName || "",
       groupCode: log.groupCode || DEFAULT_GROUP_CODE,
       email: log.email || "",
       collegeName: log.collegeName || "",
       topicId: log.topicId || null,
+      topicName: topicNameMap.get(String(log.topicId || "")) || "",
       date: log.date || null,
       IP: log.IP || "",
       downloadType: log.downloadType || "",
